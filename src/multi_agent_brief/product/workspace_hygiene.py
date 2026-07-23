@@ -1,0 +1,156 @@
+"""Pure shared workspace-member and nested-workspace hygiene rules."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import stat
+from typing import Literal
+
+
+HygieneSurface = Literal["delivery", "audit", "archive", "bundle"]
+_JUNK_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
+_JUNK_SUFFIXES = (".tmp", ".temp", ".swp", ".swo")
+_BOOTSTRAP_FILES = frozenset({"config.yaml", "sources.yaml", "user.md"})
+
+
+@dataclass(frozen=True)
+class WorkspaceMemberDecision:
+    status: Literal["include", "exclude"]
+    reason_code: str | None
+    relative_path: str | None
+
+
+def is_briefloop_workspace_root(path: Path) -> bool:
+    """Recognize Store authority or the complete strict pre-Store marker set."""
+
+    try:
+        database = path / "briefloop.db"
+        if database.exists():
+            return database.is_file() and not database.is_symlink()
+        return (
+            all(
+                (path / name).is_file() and not (path / name).is_symlink()
+                for name in _BOOTSTRAP_FILES
+            )
+            and (path / "input").is_dir()
+            and not (path / "input").is_symlink()
+        )
+    except OSError:
+        return False
+
+
+def nested_workspace_ancestor(target: str | Path) -> Path | None:
+    """Return the nearest existing parent workspace, excluding target itself."""
+
+    candidate = Path(target).expanduser().absolute()
+    for parent in candidate.parents:
+        if is_briefloop_workspace_root(parent):
+            return parent
+    return None
+
+
+def classify_workspace_member(
+    workspace: str | Path,
+    candidate: str | Path,
+    *,
+    surface: HygieneSurface,
+    allowed_hidden_roots: frozenset[str] = frozenset(),
+) -> WorkspaceMemberDecision:
+    """Classify one existing candidate without following symlinks."""
+
+    del surface  # The shared rules are intentionally identical for all bundles.
+    root = Path(workspace).expanduser().resolve(strict=True)
+    raw = Path(candidate).expanduser()
+    lexical = raw if raw.is_absolute() else root / raw
+    lexical = Path(os.path.abspath(lexical))
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError:
+        return WorkspaceMemberDecision(
+            "exclude", "workspace_member_escapes_root", None
+        )
+    if not relative.parts:
+        return WorkspaceMemberDecision("exclude", "workspace_member_not_regular", ".")
+    name = relative.name
+    lower = name.lower()
+    if (
+        name in _JUNK_NAMES
+        or name.startswith("~$")
+        or name.startswith(".~lock.")
+        or name.endswith(("~", "#"))
+        or lower in {item.lower() for item in _JUNK_NAMES}
+        or lower.endswith(_JUNK_SUFFIXES)
+    ):
+        return WorkspaceMemberDecision(
+            "exclude",
+            "workspace_member_packaging_residue",
+            relative.as_posix(),
+        )
+    for index, part in enumerate(relative.parts):
+        if part.startswith(".briefloop-pub-probe-"):
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_publication_probe",
+                relative.as_posix(),
+            )
+        if part == "__MACOSX":
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_platform_metadata",
+                relative.as_posix(),
+            )
+        if part.startswith(".") and (
+            index != 0 or part not in allowed_hidden_roots
+        ):
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_hidden",
+                relative.as_posix(),
+            )
+    current = root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError:
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_unreadable",
+                relative.as_posix(),
+            )
+        if stat.S_ISLNK(info.st_mode):
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_symlink",
+                relative.as_posix(),
+            )
+        if index < len(relative.parts) - 1:
+            if not stat.S_ISDIR(info.st_mode):
+                return WorkspaceMemberDecision(
+                    "exclude",
+                    "workspace_member_non_directory_parent",
+                    relative.as_posix(),
+                )
+            if current != root and is_briefloop_workspace_root(current):
+                return WorkspaceMemberDecision(
+                    "exclude",
+                    "workspace_member_nested_workspace",
+                    relative.as_posix(),
+                )
+        elif not stat.S_ISREG(info.st_mode):
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_not_regular",
+                relative.as_posix(),
+            )
+    return WorkspaceMemberDecision("include", None, relative.as_posix())
+
+
+__all__ = [
+    "WorkspaceMemberDecision",
+    "classify_workspace_member",
+    "is_briefloop_workspace_root",
+    "nested_workspace_ancestor",
+]

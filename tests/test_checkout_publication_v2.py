@@ -31,6 +31,7 @@ from multi_agent_brief.core_run_v2.checkout import (
 from multi_agent_brief.core_run_v2.errors import CoreRunError
 from multi_agent_brief.core_run_v2.publication import CheckoutPublicationEngine
 from multi_agent_brief.core_run_v2.publication_platform import (
+    RetainedParent,
     capability_profile,
     open_retained_parent,
     probe_publication_capability,
@@ -558,6 +559,7 @@ def test_windows_capability_rejects_without_store_or_filesystem_delta(
 @pytest.mark.skipif(sys.platform != "darwin", reason="real macOS primitive")
 def test_macos_real_primitive_refuses_occupied_target_and_attests_post(tmp_path: Path) -> None:
     profile = probe_publication_capability(tmp_path)
+    assert not tuple(tmp_path.glob(".briefloop-pub-probe-*"))
     assert profile.namespace_primitive == "renameatx_np(RENAME_EXCL)"
     assert profile.canonical_post_durability == "F_FULLFSYNC"
     with open_retained_parent(tmp_path, profile) as parent:
@@ -577,4 +579,56 @@ def test_publication_source_has_no_path_replace_or_automatic_unlink() -> None:
     ).read_text(encoding="utf-8")
     assert "os.replace(" not in source + platform_source
     assert "os.rename(" not in source + platform_source
-    assert "os.unlink(" not in source + platform_source
+    assert "os.unlink(" not in source
+    assert platform_source.count("os.unlink(") == 1
+    assert "shutil.rmtree" not in platform_source
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real macOS primitive")
+def test_probe_capability_failure_cleans_exact_owned_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unsupported(*_args, **_kwargs):
+        raise CoreRunError("checkout_publication_unsupported")
+
+    monkeypatch.setattr(RetainedParent, "no_clobber_rename", unsupported)
+    with pytest.raises(CoreRunError, match="checkout_publication_unsupported"):
+        probe_publication_capability(tmp_path)
+    assert not tuple(tmp_path.glob(".briefloop-pub-probe-*"))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real macOS primitive")
+def test_probe_directory_identity_replacement_is_preserved_and_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RetainedParent.attest_canonical_blob
+
+    def replace_name(
+        retained: RetainedParent,
+        leaf: str,
+        expected_sha256: str,
+        size: int,
+    ) -> None:
+        original(retained, leaf, expected_sha256, size)
+        displaced = retained.path.with_name(retained.path.name + "-owned")
+        retained.path.rename(displaced)
+        retained.path.mkdir()
+        (retained.path / "user-content").write_text("preserve\n", encoding="utf-8")
+
+    monkeypatch.setattr(RetainedParent, "attest_canonical_blob", replace_name)
+    with pytest.raises(
+        CoreRunError,
+        match="checkout_publication_probe_cleanup_failed",
+    ):
+        probe_publication_capability(tmp_path)
+    replacements = [
+        item
+        for item in tmp_path.glob(".briefloop-pub-probe-*")
+        if not item.name.endswith("-owned")
+    ]
+    assert len(replacements) == 1
+    assert (replacements[0] / "user-content").read_text(encoding="utf-8") == (
+        "preserve\n"
+    )

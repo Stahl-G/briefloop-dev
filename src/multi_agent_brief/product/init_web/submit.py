@@ -36,6 +36,7 @@ from multi_agent_brief.runtime_host_v2.initialization import (
     WorkspaceBootstrap,
 )
 from multi_agent_brief.core_run_v2.output_contract import resolve_output_extent
+from multi_agent_brief.product.workspace_hygiene import nested_workspace_ancestor
 from multi_agent_brief.workspace.init_profile import InitProfile
 
 from .staging import InitWebStaging, InitWebStagingError
@@ -490,6 +491,8 @@ class InitWebSubmitter:
                 )
             if authority_kind == "invalid_sqlite":
                 raise SubmissionError("control_store_integrity_invalid", 500)
+            if nested_workspace_ancestor(target) is not None:
+                raise SubmissionError("workspace_target_nested", 409)
             if self._target_has_content(target):
                 raise SubmissionError("workspace_target_exists", 409)
 
@@ -546,6 +549,7 @@ class InitWebSubmitter:
                 force=False,
                 identity_factory=lambda: next(identities),
                 execution_authorization=execution_authorization,
+                post_finalize_html=execution_authorization is not None,
             )
             try:
                 initialized = bootstrap.initialize_runnable_codex(

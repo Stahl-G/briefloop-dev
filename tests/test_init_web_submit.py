@@ -158,6 +158,8 @@ def test_committed_submission_creates_runnable_workspace_and_real_receipt(
     assert response["status"] == "committed"
     workspace = tmp_path / "web-ws"
     assert (workspace / "config.yaml").is_file()
+    config = yaml.safe_load((workspace / "config.yaml").read_text(encoding="utf-8"))
+    assert config["output"]["html_report"]["auto_open"] is False
     assert (workspace / ".codex" / "config.toml").is_file()
     assert (workspace / "briefloop.db").is_file()
     expected_receipt_id = derived_id(
@@ -204,6 +206,7 @@ def test_authorized_submission_freezes_manifest_and_returns_first_action(
     authorization = config["controlstore_v2"]["execution_authorization"]
     assert authorization["completion_target"] == "finalized_local"
     assert authorization["source_manifest_member_count"] == 1
+    assert config["output"]["html_report"]["auto_open"] is True
 
 
 def test_source_manifest_preview_is_server_canonical_and_zero_workspace_write(
@@ -995,6 +998,24 @@ def test_existing_non_empty_target_conflicts(tmp_path: Path) -> None:
         submitter.submit(_body("REQ-AAAA0007", "web-ws"))
     assert exc_info.value.error_code == "workspace_target_exists"
     assert exc_info.value.http_status == 409
+
+
+def test_target_nested_below_existing_workspace_rejects_before_writes(
+    tmp_path: Path,
+) -> None:
+    submitter = InitWebSubmitter(base_dir=tmp_path)
+    _submit_ok(submitter, _body("REQ-OUTER-0001", "outer"))
+    outer = tmp_path / "outer"
+    revision_before = _revision(outer)
+    nested = outer / "nested"
+
+    with pytest.raises(SubmissionError) as exc_info:
+        submitter.submit(_body("REQ-NESTED-001", "outer/nested"))
+
+    assert exc_info.value.error_code == "workspace_target_nested"
+    assert exc_info.value.http_status == 409
+    assert not nested.exists()
+    assert _revision(outer) == revision_before
 
 
 def test_malformed_body_is_rejected(tmp_path: Path) -> None:

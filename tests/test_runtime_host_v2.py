@@ -22,6 +22,7 @@ from multi_agent_brief.core_run_v2.verifier import CoreRunDomainVerifier
 from multi_agent_brief.runtime_host_v2 import RuntimeHostError
 from multi_agent_brief.runtime_host_v2.initialization import initialize_or_open_runtime
 from multi_agent_brief.runtime_host_v2.projections import (
+    build_local_run_presentation,
     build_store_quality_projection,
     build_store_status_projection,
 )
@@ -416,11 +417,40 @@ def test_store_status_ignores_forged_legacy_projections(tmp_path: Path) -> None:
     assert quality == {
         "ok": False,
         "status": "projection_not_available",
-        "reason_code": "package_not_ready",
+        "reason_code": "final_reader_not_available",
         "authority": "sqlite_control_store",
         "run_id": "RUN-run",
         "store_revision": first["store_revision"],
     }
+
+
+def test_local_presentation_uses_one_loaded_history_without_head_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    initialize_or_open_runtime(workspace, adapter_loader=_adapter)
+    original = SQLiteControlStore.load_history
+    calls = 0
+
+    def counted(store: SQLiteControlStore):
+        nonlocal calls
+        calls += 1
+        return original(store)
+
+    monkeypatch.setattr(SQLiteControlStore, "load_history", counted)
+    monkeypatch.setattr(
+        SQLiteControlStore,
+        "load_workspace_run_head",
+        lambda _store: (_ for _ in ()).throw(AssertionError("head reopened")),
+    )
+
+    presentation = build_local_run_presentation(workspace)
+
+    assert calls == 1
+    assert presentation.view_state == "setup"
+    assert presentation.reader_brief.state == "unavailable"
+    assert presentation.presentation.status == "not_requested"
 
 
 def _delivery_result_ready_host(

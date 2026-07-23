@@ -86,6 +86,16 @@ the initiating Codex process. The uninterrupted path is an already-active
 controller continuing under its already-loaded BriefLoop protocol; the kit is
 Store-bound for verification and reopened/future workspace sessions.
 
+When authorized continuation returns truthful `finalized_local`, its
+`presentation` is best-effort and read-only. A successful static projection is
+`output/brief_pages.html`; `browser_unavailable` or
+`projection_unavailable` returns a typed relative-path fallback and never
+changes finalization truth. The file contains the exact Store-bound
+`reader_brief`, not mutable workspace Markdown, and is not approval, packaging,
+delivery, publication, or a persistent localhost service. LAJ appears only
+when an explicit hash-bound advisory view is supplied; Improvement Ledger
+remains unavailable.
+
 Hard boundaries:
 
 - Never write SQL, `briefloop.db`, a Receipt, ledger row, or transaction row.
