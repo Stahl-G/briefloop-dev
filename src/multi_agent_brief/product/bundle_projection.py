@@ -37,10 +37,10 @@ from multi_agent_brief.product.quality_panel import (
 )
 from multi_agent_brief.product.report_spec import ReportSpecLoadError, load_report_spec
 from multi_agent_brief.product.template_registry import ReportTemplateRegistry
+from multi_agent_brief.product.workspace_hygiene import classify_workspace_member
 
 REPORT_BUNDLE_MANIFEST_SCHEMA_VERSION = "briefloop.report_bundle_manifest.v1"
 _ASCII_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_JUNK_SUFFIXES = {".tmp", ".temp", ".swp", ".swo"}
 _DELIVERY_BUNDLE_README_MEMBER = "delivery/_BUNDLE_README.md"
 _AUDIT_BUNDLE_README_MEMBER = "audit/_BUNDLE_README.md"
 _DELIVERY_BUNDLE_README = """# BriefLoop Delivery Bundle
@@ -85,6 +85,10 @@ def build_report_bundle_manifest(
     hygiene: dict[str, Any] = {"status": "clean", "excluded_artifacts": []}
     delivery_records = _delivery_records(ws, finalize_report, hygiene=hygiene)
     audit_records = _audit_records(ws, finalize_report, hygiene=hygiene)
+    hygiene["excluded_artifacts"] = sorted(
+        hygiene["excluded_artifacts"],
+        key=lambda item: (item["surface"], item["path"], item["reason"]),
+    )
     if hygiene["excluded_artifacts"]:
         hygiene["status"] = "excluded_packaging_junk"
     template = _template_projection(
@@ -221,6 +225,15 @@ def _write_zip_from_records(
             rel = str(record.get("path") or "").strip()
             if not rel:
                 continue
+            decision = classify_workspace_member(
+                workspace,
+                rel,
+                surface="bundle",
+            )
+            if decision.status != "include" or decision.relative_path is None:
+                raise ReportBundleProjectionError(
+                    f"bundle member is not hygienic: {rel}: {decision.reason_code}"
+                )
             source = _resolve_workspace_path(workspace, rel)
             arcname = _archive_member_name(rel, surface=surface)
             info = zipfile.ZipInfo(arcname)
@@ -315,16 +328,26 @@ def _delivery_records(
     for raw in raw_artifacts:
         if not isinstance(raw, str) or not raw.strip():
             raise ReportBundleProjectionError("finalize_report.json contains an invalid delivery artifact path.")
-        path = _resolve_workspace_path(workspace, raw)
+        decision = classify_workspace_member(
+            workspace,
+            raw,
+            surface="delivery",
+        )
+        if decision.status != "include" or decision.relative_path is None:
+            _record_hygiene_exclusion(
+                decision.relative_path or "outside_workspace",
+                hygiene=hygiene,
+                surface="delivery",
+                reason=decision.reason_code or "workspace_member_excluded",
+            )
+            continue
+        path = _resolve_workspace_path(workspace, decision.relative_path)
         try:
             path.relative_to(delivery_root)
         except ValueError as exc:
             raise ReportBundleProjectionError(
                 "delivery artifacts must be under output/delivery/."
             ) from exc
-        if _is_packaging_junk(path):
-            _record_hygiene_exclusion(workspace, path, hygiene=hygiene, surface="delivery")
-            continue
         expected_sha = _hash_for_path(hashes, raw=raw, workspace=workspace, path=path)
         if not expected_sha:
             raise ReportBundleProjectionError(
@@ -409,8 +432,18 @@ def _audit_records(
         rel = _workspace_relative(workspace, resolved)
         if rel in seen:
             continue
-        if _is_packaging_junk(resolved):
-            _record_hygiene_exclusion(workspace, resolved, hygiene=hygiene, surface="audit")
+        decision = classify_workspace_member(
+            workspace,
+            resolved,
+            surface="audit",
+        )
+        if decision.status != "include":
+            _record_hygiene_exclusion(
+                decision.relative_path or "outside_workspace",
+                hygiene=hygiene,
+                surface="audit",
+                reason=decision.reason_code or "workspace_member_excluded",
+            )
             continue
         seen.add(rel)
         records.append(_artifact_record(workspace, resolved, role=role))
@@ -630,34 +663,18 @@ def _artifact_record(workspace: Path, path: Path, *, role: str) -> dict[str, Any
     return record
 
 
-def _is_packaging_junk(path: Path) -> bool:
-    parts = set(path.parts)
-    name = path.name
-    lower = name.lower()
-    return (
-        "__MACOSX" in parts
-        or name == ".DS_Store"
-        or name.startswith("~$")
-        or name.startswith(".~lock.")
-        or name.endswith("~")
-        or name.endswith("#")
-        or lower in {"thumbs.db", "desktop.ini"}
-        or lower.endswith(tuple(_JUNK_SUFFIXES))
-    )
-
-
 def _record_hygiene_exclusion(
-    workspace: Path,
-    path: Path,
+    relative_path: str,
     *,
     hygiene: dict[str, Any],
     surface: str,
+    reason: str,
 ) -> None:
     exclusions = hygiene.setdefault("excluded_artifacts", [])
     exclusions.append({
-        "path": _workspace_relative(workspace, path),
+        "path": relative_path,
         "surface": surface,
-        "reason": "packaging_junk",
+        "reason": reason,
     })
 
 

@@ -96,6 +96,8 @@ def _replace_projection(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        if _sha256_bytes(path.read_bytes()) != _sha256_bytes(payload):
+            raise OSError("brief HTML verification failed")
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)
@@ -136,10 +138,41 @@ def write_brief_pages(
         "open_requested": open_browser,
         "browser_opened": opened,
         "reason_code": reason,
+        "presentation": {
+            "status": (
+                "opened"
+                if opened
+                else ("browser_unavailable" if open_browser else "written")
+            ),
+            "relative_path": target.relative_to(root).as_posix(),
+            "reason_code": reason,
+        },
         "quality_status": data["quality"]["status"],
         "semantic_status": data["semantic"]["status"],
         "improvement_status": data["improvement"]["status"],
     }
+
+
+def present_local_run(
+    workspace: str | Path,
+    *,
+    browser_open: Callable[[str], bool] | None = None,
+) -> dict[str, Any]:
+    """Attempt the replaceable final HTML and return a typed relative fallback."""
+
+    try:
+        result = write_brief_pages(
+            workspace,
+            open_browser=True,
+            browser_open=browser_open or webbrowser.open,
+        )
+        return dict(result["presentation"])
+    except Exception:
+        return {
+            "status": "projection_unavailable",
+            "relative_path": None,
+            "reason_code": "brief_html_projection_unavailable",
+        }
 
 
 def html_report_auto_open_enabled(workspace: str | Path) -> bool:
@@ -167,9 +200,13 @@ def maybe_auto_open_brief_pages(workspace: str | Path) -> dict[str, Any] | None:
     try:
         if not html_report_auto_open_enabled(workspace):
             return None
-        return write_brief_pages(workspace, open_browser=True)
+        return present_local_run(workspace)
     except Exception:
-        return None
+        return {
+            "status": "projection_unavailable",
+            "relative_path": None,
+            "reason_code": "brief_html_projection_unavailable",
+        }
 
 
 __all__ = [
@@ -177,6 +214,7 @@ __all__ = [
     "OUTPUT_RELATIVE_PATH",
     "html_report_auto_open_enabled",
     "maybe_auto_open_brief_pages",
+    "present_local_run",
     "read_brief_asset",
     "render_brief_pages_html",
     "verify_asset_provenance",

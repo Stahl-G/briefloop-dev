@@ -21,6 +21,7 @@ from multi_agent_brief.product.quality_panel import (
     write_quality_summary,
 )
 from multi_agent_brief.product.template_registry import ReportTemplateRegistry
+from multi_agent_brief.product.workspace_hygiene import classify_workspace_member
 from tests.helpers import sha256_file as _sha256_file
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -409,12 +410,30 @@ def test_report_bundle_manifest_excludes_packaging_junk(tmp_path: Path) -> None:
     ws = _finalized_workspace(tmp_path)
     delivery_junk = ws / "output" / "delivery" / ".DS_Store"
     delivery_junk.write_text("macOS metadata\n", encoding="utf-8")
+    hidden = ws / "output" / "delivery" / ".hidden.md"
+    hidden.write_text("hidden\n", encoding="utf-8")
+    probe = (
+        ws
+        / "output"
+        / "delivery"
+        / ".briefloop-pub-probe-owned"
+        / "member.md"
+    )
+    probe.parent.mkdir()
+    probe.write_text("probe\n", encoding="utf-8")
+    nested = ws / "output" / "delivery" / "nested"
+    nested.mkdir()
+    (nested / "briefloop.db").write_bytes(b"nested")
+    nested_member = nested / "member.md"
+    nested_member.write_text("nested\n", encoding="utf-8")
     trace_junk = ws / "output" / ".~lock.source_appendix_trace.md#"
     trace_junk.write_text("editor lock\n", encoding="utf-8")
     report_path = ws / "output" / "intermediate" / "finalize_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    report["delivery_artifacts"].append("output/delivery/.DS_Store")
-    report["delivery_artifact_sha256"]["output/delivery/.DS_Store"] = _sha256_file(delivery_junk)
+    for path in (delivery_junk, hidden, probe, nested_member):
+        relative = path.relative_to(ws).as_posix()
+        report["delivery_artifacts"].append(relative)
+        report["delivery_artifact_sha256"][relative] = _sha256_file(path)
     report["source_appendix_trace"] = "output/.~lock.source_appendix_trace.md#"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -422,17 +441,63 @@ def test_report_bundle_manifest_excludes_packaging_junk(tmp_path: Path) -> None:
 
     delivery_paths = {item["path"] for item in manifest["delivery_bundle"]["artifacts"]}
     audit_paths = {item["path"] for item in manifest["audit_bundle"]["artifacts"]}
-    excluded_paths = {
-        item["path"]
+    excluded = {
+        item["path"]: item["reason"]
         for item in manifest["packaging_hygiene"]["excluded_artifacts"]
     }
+    assert manifest["packaging_hygiene"]["excluded_artifacts"] == sorted(
+        manifest["packaging_hygiene"]["excluded_artifacts"],
+        key=lambda item: (item["surface"], item["path"], item["reason"]),
+    )
     assert "output/delivery/.DS_Store" not in delivery_paths
+    assert "output/delivery/.hidden.md" not in delivery_paths
+    assert (
+        "output/delivery/.briefloop-pub-probe-owned/member.md"
+        not in delivery_paths
+    )
+    assert "output/delivery/nested/member.md" not in delivery_paths
     assert "output/.~lock.source_appendix_trace.md#" not in audit_paths
     assert manifest["packaging_hygiene"]["status"] == "excluded_packaging_junk"
-    assert excluded_paths == {
-        "output/delivery/.DS_Store",
-        "output/.~lock.source_appendix_trace.md#",
+    assert excluded == {
+        "output/.~lock.source_appendix_trace.md#": (
+            "workspace_member_packaging_residue"
+        ),
+        "output/delivery/.DS_Store": "workspace_member_packaging_residue",
+        "output/delivery/.briefloop-pub-probe-owned/member.md": (
+            "workspace_member_publication_probe"
+        ),
+        "output/delivery/.hidden.md": "workspace_member_hidden",
+        "output/delivery/nested/member.md": "workspace_member_nested_workspace",
     }
+
+
+def test_shared_hygiene_excludes_probe_hidden_symlink_and_nested_workspace(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    hidden = ws / "output" / "delivery" / ".hidden.md"
+    hidden.write_text("hidden\n", encoding="utf-8")
+    probe = ws / "output" / ".briefloop-pub-probe-owned" / "member"
+    probe.parent.mkdir()
+    probe.write_text("probe\n", encoding="utf-8")
+    link = ws / "output" / "delivery" / "linked.md"
+    link.symlink_to(ws / "output" / "delivery" / "brief.md")
+    nested = ws / "output" / "delivery" / "nested"
+    nested.mkdir()
+    (nested / "briefloop.db").write_bytes(b"nested")
+    nested_member = nested / "member.md"
+    nested_member.write_text("nested\n", encoding="utf-8")
+
+    decisions = {
+        path: classify_workspace_member(ws, path, surface="bundle")
+        for path in (hidden, probe, link, nested_member)
+    }
+
+    assert decisions[hidden].reason_code == "workspace_member_hidden"
+    assert decisions[probe].reason_code == "workspace_member_publication_probe"
+    assert decisions[link].reason_code == "workspace_member_symlink"
+    assert decisions[nested_member].reason_code == "workspace_member_nested_workspace"
+    assert all(item.status == "exclude" for item in decisions.values())
 
 
 def test_report_bundle_manifest_preserves_utf8_paths_with_ascii_fallback(tmp_path: Path) -> None:

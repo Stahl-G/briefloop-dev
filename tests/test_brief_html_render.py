@@ -23,7 +23,7 @@ from tests.helpers import initialize_workspace
 
 def _minimal_data() -> dict[str, object]:
     return {
-        "schema_version": "briefloop.brief_pages.data.v1",
+        "schema_version": "briefloop.brief_pages.data.v2",
         "generated_at": "2026-07-21T00:00:00Z",
         "boundary": "read-only",
         "workspace": {
@@ -32,9 +32,33 @@ def _minimal_data() -> dict[str, object]:
             "store_revision": 1,
             "authority": "sqlite_control_store",
         },
+        "run": {
+            "view_state": "finalized",
+            "completed_stages": 10,
+            "total_stages": 10,
+            "current_stage": None,
+            "current_role": None,
+            "reason_code": "local_finalization_complete",
+            "terminal_state": "finalized_local",
+            "completion_target": "finalized_local",
+        },
+        "brief": {
+            "status": "available",
+            "view_state": "finalized",
+            "terminal_state": "finalized_local",
+            "completion_target": "finalized_local",
+            "reason_code": "local_finalization_complete",
+            "artifact": {
+                "artifact_id": "reader_brief",
+                "revision": 1,
+                "sha256": "a" * 64,
+            },
+            "markdown": "# Reader brief\n\nExact text.\n",
+            "boundary": "local only",
+        },
         "quality": {
             "status": "unavailable",
-            "reason_code": "package_not_ready",
+            "reason_code": "final_reader_not_available",
             "boundary": "projection_only_not_gate_or_delivery_authority",
             "projection": {"ok": False},
             "groups": {key: [] for key in (
@@ -76,7 +100,7 @@ def test_render_is_self_contained_and_embeds_parseable_data() -> None:
     assert '<script src=' not in html and "<link" not in html
     island = html.split('id="brief-pages-data">', 1)[1].split("</script>", 1)[0]
     payload = json.loads(island)
-    assert payload["schema_version"] == "briefloop.brief_pages.data.v1"
+    assert payload["schema_version"] == "briefloop.brief_pages.data.v2"
     assert payload["workspace"]["run_id"] == "RUN-1"
 
 

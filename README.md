@@ -363,8 +363,13 @@ Current main entrypoints:
   --runtime codex`, followed by `briefloop runtime next`,
   `invocation-start`, `invocation-accept|fail`, and `apply`
 - Experimental one-shot web initialization: `briefloop init <path> --web`
-- read-only three-page report view: `briefloop quality html --workspace <path>
-  [--open]`
+- local, static, read-only four-tab view: `briefloop quality html --workspace
+  <path> [--open]`; Brief shows the verified Store-bound `finalized_local`
+  reader, Quality is a deterministic projection, LAJ is optional explicit
+  hash-bound advisory input (never authority), and Improvement is honestly
+  unavailable because no Store-native writer/lifecycle is active. This view
+  does not imply approval, package readiness, delivery, publication, automatic
+  learning, or a persistent browser server.
 - experimental offline-shadow LAJ: `briefloop experiments laj shadow-run` and
   `briefloop experiments laj present` for public/synthetic advisory evaluation
   and standalone JSON/Markdown/HTML presentation; an explicitly supplied

@@ -25,6 +25,14 @@ not evidence that an already-running Codex session hot-loaded newly written
 project assets; the supported uninterrupted flow is an already-active
 controller continuing with the protocol it already loaded.
 
+On truthful `finalized_local`, `runtime continue` may return a best-effort
+read-only `presentation`. Its relative static file is
+`output/brief_pages.html`; browser/projection failure is typed and cannot
+change terminal truth. The HTML uses the exact Store-bound `reader_brief` and
+is not approval, packaging, delivery, publication, or a persistent localhost
+service. LAJ remains explicit hash-bound advisory input and Improvement Ledger
+remains unavailable.
+
 The Store-derived `CoreRunNextAction` is the only sequence authority. Always
 snapshot the exact current action JSON, then dispatch only its `action_kind`:
 
