@@ -29,6 +29,7 @@ _CLI_OVERRIDE_NAMES = (
     "MULTI_AGENT_BRIEF_BIN",
 )
 _CLI_NAMES = ("briefloop", "multi-agent-brief")
+_HERMES_RUNTIME_ARGS = ("--runtime", "hermes")
 _CLI_UNAVAILABLE_REASON = "briefloop_cli_unavailable"
 _CLI_OVERRIDE_UNAVAILABLE_REASON = "briefloop_explicit_override_unavailable"
 
@@ -50,10 +51,19 @@ def _resolve_cli(
     repo_root: Path | None,
     environ: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] = shutil.which,
+    resolution_cwd: Path | None = None,
 ) -> _CliResolution:
     """Resolve one executable CLI without weakening explicit override intent."""
 
     current_environ = os.environ if environ is None else environ
+    current_directory = Path.cwd() if resolution_cwd is None else resolution_cwd
+
+    def freeze(executable: str) -> str:
+        path = Path(executable).expanduser()
+        if not path.is_absolute():
+            path = current_directory / path
+        return str(path.resolve())
+
     for override_name in _CLI_OVERRIDE_NAMES:
         if override_name not in current_environ:
             continue
@@ -67,7 +77,7 @@ def _resolve_cli(
                 override_name=override_name,
             )
         return _CliResolution(
-            command=executable,
+            command=freeze(executable),
             source="explicit_override",
             reason_code=None,
             override_name=override_name,
@@ -77,7 +87,7 @@ def _resolve_cli(
         executable = which(command_name)
         if executable is not None:
             return _CliResolution(
-                command=executable,
+                command=freeze(executable),
                 source=f"path_{command_name.replace('-', '_')}",
                 reason_code=None,
             )
@@ -88,7 +98,7 @@ def _resolve_cli(
                 executable = which(str(bindir / command_name))
                 if executable is not None:
                     return _CliResolution(
-                        command=executable,
+                        command=freeze(executable),
                         source=f"repo_local_{command_name.replace('-', '_')}",
                         reason_code=None,
                     )
@@ -250,7 +260,7 @@ def init_workspace(args: dict, **kwargs) -> str:
     try:
         workspace = _resolve_workspace(args["workspace"])
         onboarding_path = Path(args["onboarding_path"]).expanduser().resolve()
-        resolution = _resolve_cli(repo_root=None)
+        resolution = _resolve_cli(repo_root=_find_repo_root())
 
         if resolution.command is None:
             result = _cli_unavailable_result(resolution)
@@ -434,8 +444,7 @@ def run_handoff(args: dict, **kwargs) -> str:
                 "run",
                 "--workspace",
                 str(workspace),
-                "--runtime",
-                "hermes",
+                *_HERMES_RUNTIME_ARGS,
             ]
             if repo_root is not None:
                 cmd.extend(["--repo-workdir", str(repo_root)])

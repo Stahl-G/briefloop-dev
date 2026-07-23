@@ -341,6 +341,20 @@ def test_cli_resolver_preserves_explicit_override_precedence_and_failure():
     assert invalid.reason_code == "briefloop_explicit_override_unavailable"
 
 
+def test_cli_resolver_freezes_relative_which_result_before_cwd_changes(tmp_path):
+    caller = tmp_path / "caller"
+    expected = caller / "bin" / "briefloop"
+
+    resolution = tools._resolve_cli(
+        repo_root=None,
+        environ={},
+        which=_which_from({"briefloop": "bin/briefloop"}),
+        resolution_cwd=caller,
+    )
+
+    assert resolution.command == str(expected.resolve())
+
+
 def test_plugin_readme_marks_mabw_command_as_legacy_and_uses_public_cli():
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -499,3 +513,49 @@ def test_invalid_explicit_override_is_identical_and_never_falls_back(
     assert handoff["ok"] is False
     assert handoff["reason_code"] == "briefloop_explicit_override_unavailable"
     assert handoff["command"] == []
+
+
+def test_init_and_handoff_probe_the_same_repo_local_environment(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    onboarding = workspace / "onboarding.json"
+    onboarding.write_text("{}\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    command = str(repo_root / ".venv" / "bin" / "briefloop")
+    probed_roots = []
+
+    def fake_resolve(*, repo_root, **_kwargs):
+        probed_roots.append(repo_root)
+        return tools._CliResolution(
+            command=command,
+            source="repo_local_briefloop",
+            reason_code=None,
+        )
+
+    def fake_run(cmd, cwd=None, timeout=300):
+        del cwd, timeout
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "command": cmd,
+        }
+
+    monkeypatch.setattr(tools, "_find_repo_root", lambda: repo_root)
+    monkeypatch.setattr(tools, "_resolve_cli", fake_resolve)
+    monkeypatch.setattr(tools, "_run", fake_run)
+
+    initialized = json.loads(
+        tools.init_workspace(
+            {
+                "workspace": str(workspace),
+                "onboarding_path": str(onboarding),
+            }
+        )
+    )
+    handoff = json.loads(tools.run_handoff({"workspace": str(workspace)}))
+
+    assert initialized["command"][0] == handoff["command"][0] == command
+    assert probed_roots == [repo_root, repo_root]
