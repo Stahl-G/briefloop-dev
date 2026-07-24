@@ -807,6 +807,193 @@ def test_packs_bundle_cli_writes_clean_archives_from_manifest(
     assert rerun_manifest["bundle_archives"]["audit"]["sha256"] == first_audit_sha
 
 
+@pytest.mark.parametrize(
+    "relative_target",
+    (
+        "output/delivery_bundle.zip",
+        "output/audit_bundle.zip",
+        "output/report_bundle_manifest.json",
+    ),
+)
+def test_bundle_projection_preserves_symlinked_final_targets(
+    tmp_path: Path,
+    relative_target: str,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    outside = tmp_path / f"outside-{Path(relative_target).name}"
+    outside.write_bytes(b"external sentinel")
+    target = ws / relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks unavailable")
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="not a replaceable regular file",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.is_symlink()
+    assert outside.read_bytes() == b"external sentinel"
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_rejects_replaced_output_parent_without_writing_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    original_stage = bundle_projection._stage_zip_projection
+    calls = 0
+
+    def stage_and_replace_parent(**kwargs):
+        nonlocal calls
+        staged = original_stage(**kwargs)
+        calls += 1
+        if calls == 1:
+            (ws / "output").rename(ws / "owned-output")
+            (ws / "output").mkdir()
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_zip_projection",
+        stage_and_replace_parent,
+    )
+
+    with pytest.raises(ReportBundleProjectionError):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert list((ws / "output").iterdir()) == []
+    assert not list((ws / "owned-output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_rejects_symlinked_manifest_parent_without_external_write(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    outside = tmp_path / "outside-parent"
+    outside.mkdir()
+    alias = ws / "projection-alias"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="parent is unavailable",
+    ):
+        write_report_bundle_manifest(
+            workspace=ws,
+            output_path="projection-alias/manifest.json",
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_bundle_projection_preserves_final_leaf_that_appears_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "output" / "delivery_bundle.zip"
+    original_stage = bundle_projection._stage_zip_projection
+    calls = 0
+
+    def stage_and_add_unknown_leaf(**kwargs):
+        nonlocal calls
+        staged = original_stage(**kwargs)
+        calls += 1
+        if calls == 1:
+            target.write_bytes(b"unknown replacement")
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_zip_projection",
+        stage_and_add_unknown_leaf,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="target changed",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.read_bytes() == b"unknown replacement"
+    assert not (ws / "output" / "audit_bundle.zip").exists()
+    assert not (ws / "output" / "report_bundle_manifest.json").exists()
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_preserves_final_leaf_replaced_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "output" / "delivery_bundle.zip"
+    target.write_bytes(b"previous projection")
+    original_stage = bundle_projection._stage_zip_projection
+    calls = 0
+
+    def stage_and_replace_leaf(**kwargs):
+        nonlocal calls
+        staged = original_stage(**kwargs)
+        calls += 1
+        if calls == 1:
+            replacement = ws / "output" / "replacement.zip"
+            replacement.write_bytes(b"unknown replacement")
+            replacement.replace(target)
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_zip_projection",
+        stage_and_replace_leaf,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="target changed",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.read_bytes() == b"unknown replacement"
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_preserves_manifest_leaf_that_appears_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "output" / "report_bundle_manifest.json"
+    original_stage = bundle_projection._stage_bytes_projection
+
+    def stage_and_add_unknown_leaf(**kwargs):
+        staged = original_stage(**kwargs)
+        target.write_bytes(b"unknown manifest")
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_bytes_projection",
+        stage_and_add_unknown_leaf,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="target changed",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.read_bytes() == b"unknown manifest"
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
 def test_packs_bundle_rejects_manifest_output_reserved_for_archives(
     tmp_path: Path,
 ) -> None:

@@ -25,6 +25,10 @@ from multi_agent_brief.product.init_web.submit import (
     _profile_from_payload,
 )
 from multi_agent_brief.product.init_web.staging import InitWebStaging
+from multi_agent_brief.product.workspace_hygiene import (
+    NestedWorkspaceTargetError,
+    canonical_workspace_target,
+)
 from multi_agent_brief.runtime_assets import RuntimeAssetInstallError
 from multi_agent_brief.runtime_host_v2.initialization import WorkspaceBootstrap
 
@@ -1016,6 +1020,47 @@ def test_target_nested_below_existing_workspace_rejects_before_writes(
     assert exc_info.value.http_status == 409
     assert not nested.exists()
     assert _revision(outer) == revision_before
+
+
+def test_direct_create_workspace_rejects_alias_into_existing_workspace(
+    tmp_path: Path,
+) -> None:
+    outer = tmp_path / "outer"
+    profile = _profile_from_payload(_body("REQ-DIRECT-OUTER", "outer")["payload"])
+    create_workspace(outer, profile)
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(outer / "input" / "context", target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(NestedWorkspaceTargetError):
+        create_workspace(alias / "nested", profile)
+
+    assert not (outer / "input" / "context" / "nested").exists()
+
+
+def test_canonical_target_remains_bound_after_input_alias_replacement(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(original, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+    canonical = canonical_workspace_target(alias / "workspace")
+    alias.unlink()
+    alias.symlink_to(replacement, target_is_directory=True)
+    profile = _profile_from_payload(_body("REQ-ALIAS-SWAP", "workspace")["payload"])
+
+    create_workspace(canonical, profile)
+
+    assert (original / "workspace" / "config.yaml").exists()
+    assert not (replacement / "workspace").exists()
 
 
 def test_malformed_body_is_rejected(tmp_path: Path) -> None:

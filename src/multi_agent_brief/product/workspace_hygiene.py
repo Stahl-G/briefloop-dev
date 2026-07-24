@@ -51,13 +51,39 @@ def is_briefloop_workspace_root(path: Path) -> bool:
 
 
 def nested_workspace_ancestor(target: str | Path) -> Path | None:
-    """Return the nearest existing parent workspace, excluding target itself."""
+    """Return a lexical or canonical parent workspace, excluding target itself."""
 
-    candidate = Path(target).expanduser().absolute()
-    for parent in candidate.parents:
+    lexical, canonical = _workspace_target_paths(target)
+    return _nested_workspace_ancestor(lexical, canonical)
+
+
+def _nested_workspace_ancestor(lexical: Path, canonical: Path) -> Path | None:
+    seen: set[Path] = set()
+    for parent in (*lexical.parents, *canonical.parents):
+        if parent in seen:
+            continue
+        seen.add(parent)
         if is_briefloop_workspace_root(parent):
             return parent
     return None
+
+
+def canonical_workspace_target(target: str | Path) -> Path:
+    """Bind routing input to one canonical non-nested workspace target."""
+
+    lexical, canonical = _workspace_target_paths(target)
+    if _nested_workspace_ancestor(lexical, canonical) is not None:
+        raise NestedWorkspaceTargetError
+    return canonical
+
+
+def _workspace_target_paths(target: str | Path) -> tuple[Path, Path]:
+    raw = Path(target).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    lexical = Path(os.path.abspath(raw))
+    canonical = lexical.resolve(strict=False)
+    return lexical, canonical
 
 
 def classify_workspace_member(
@@ -159,6 +185,7 @@ def classify_workspace_member(
 __all__ = [
     "NestedWorkspaceTargetError",
     "WorkspaceMemberDecision",
+    "canonical_workspace_target",
     "classify_workspace_member",
     "is_briefloop_workspace_root",
     "nested_workspace_ancestor",
