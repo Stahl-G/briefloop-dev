@@ -632,3 +632,72 @@ def test_probe_directory_identity_replacement_is_preserved_and_typed(
     assert (replacements[0] / "user-content").read_text(encoding="utf-8") == (
         "preserve\n"
     )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real macOS primitive")
+def test_probe_rejects_directory_swap_before_first_child_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RetainedParent.open_verified_child_directory
+
+    def swap_before_open(
+        retained: RetainedParent,
+        leaf: str,
+        expected_identity: tuple[int, int],
+    ) -> RetainedParent:
+        created = retained.path / leaf
+        created.rename(created.with_name(created.name + "-owned"))
+        created.mkdir()
+        (created / "user-content").write_text("preserve\n", encoding="utf-8")
+        return original(retained, leaf, expected_identity)
+
+    monkeypatch.setattr(
+        RetainedParent,
+        "open_verified_child_directory",
+        swap_before_open,
+    )
+    with pytest.raises(
+        CoreRunError,
+        match="checkout_publication_probe_cleanup_failed",
+    ):
+        probe_publication_capability(tmp_path)
+    replacement = next(
+        item
+        for item in tmp_path.glob(".briefloop-pub-probe-*")
+        if not item.name.endswith("-owned")
+    )
+    assert (replacement / "user-content").read_text(encoding="utf-8") == (
+        "preserve\n"
+    )
+    assert not (replacement / "canonical").exists()
+    assert not (replacement / "occupied").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="real macOS primitive")
+def test_probe_rejects_swapped_created_leaf_without_deleting_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RetainedParent.create_and_flush
+
+    def swap_created_leaf(
+        retained: RetainedParent,
+        leaf: str,
+        content: bytes,
+    ) -> tuple[int, int]:
+        identity = original(retained, leaf, content)
+        if leaf == "source":
+            created = retained.path / leaf
+            created.rename(retained.path / "owned-source")
+            created.write_text("preserve\n", encoding="utf-8")
+        return identity
+
+    monkeypatch.setattr(RetainedParent, "create_and_flush", swap_created_leaf)
+    with pytest.raises(
+        CoreRunError,
+        match="checkout_publication_probe_cleanup_failed",
+    ):
+        probe_publication_capability(tmp_path)
+    probe = next(tmp_path.glob(".briefloop-pub-probe-*"))
+    assert (probe / "source").read_text(encoding="utf-8") == "preserve\n"

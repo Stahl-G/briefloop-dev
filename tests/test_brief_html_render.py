@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -16,6 +17,7 @@ from multi_agent_brief.product.brief_html import (
 )
 from multi_agent_brief.product.brief_html.render import (
     html_report_auto_open_enabled,
+    present_local_run,
     read_brief_asset,
 )
 from tests.helpers import initialize_workspace
@@ -177,3 +179,34 @@ def test_auto_open_config_flag_defaults_off_and_reads_true(tmp_path: Path) -> No
     config["output"]["html_report"]["auto_open"] = True
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     assert html_report_auto_open_enabled(workspace) is True
+
+
+@pytest.mark.parametrize("conflict", ["output_parent", "final_leaf"])
+def test_presentation_never_follows_output_symlinks_or_writes_external_files(
+    tmp_path: Path,
+    conflict: str,
+) -> None:
+    workspace = initialize_workspace(tmp_path / "ws")
+    database = workspace / "briefloop.db"
+    store_before = database.read_bytes()
+    external = tmp_path / "external"
+    external.mkdir()
+    outside = external / "brief_pages.html"
+    outside.write_text("EXTERNAL-SENTINEL\n", encoding="utf-8")
+    output = workspace / "output"
+    if conflict == "output_parent":
+        shutil.rmtree(output)
+        output.symlink_to(external, target_is_directory=True)
+    else:
+        output.mkdir(exist_ok=True)
+        (output / "brief_pages.html").symlink_to(outside)
+
+    result = present_local_run(workspace, browser_open=lambda _uri: True)
+
+    assert result == {
+        "status": "projection_unavailable",
+        "relative_path": None,
+        "reason_code": "brief_html_projection_unavailable",
+    }
+    assert outside.read_text(encoding="utf-8") == "EXTERNAL-SENTINEL\n"
+    assert database.read_bytes() == store_before

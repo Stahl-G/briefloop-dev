@@ -88,9 +88,9 @@ Store-bound for verification and reopened/future workspace sessions.
 
 When authorized continuation returns truthful `finalized_local`, its
 `presentation` is best-effort and read-only. A successful static projection is
-`output/brief_pages.html`; `browser_unavailable` or
-`projection_unavailable` returns a typed relative-path fallback and never
-changes finalization truth. The file contains the exact Store-bound
+`output/brief_pages.html`; `browser_unavailable` retains that safe relative
+path, while `projection_unavailable` has no path because no safe projection
+was written. Neither result changes finalization truth. The file contains the exact Store-bound
 `reader_brief`, not mutable workspace Markdown, and is not approval, packaging,
 delivery, publication, or a persistent localhost service. LAJ appears only
 when an explicit hash-bound advisory view is supplied; Improvement Ledger

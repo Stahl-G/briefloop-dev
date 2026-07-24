@@ -424,6 +424,14 @@ def create_workspace(
     execution_authorization: RunExecutionAuthorizationBootstrap | None = None,
     post_finalize_html: bool = False,
 ) -> None:
+    from multi_agent_brief.product.workspace_hygiene import (
+        NestedWorkspaceTargetError,
+        nested_workspace_ancestor,
+    )
+
+    if nested_workspace_ancestor(target) is not None:
+        raise NestedWorkspaceTargetError
+
     # Set decision mode based on source profile
     if profile.source_profile == "llm_decide":
         profile.source_decision_mode = "agent_decide"

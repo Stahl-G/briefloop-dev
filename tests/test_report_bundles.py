@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from multi_agent_brief.cli.main import main
+from multi_agent_brief.product import bundle_projection
 from multi_agent_brief.product.bundle_projection import (
     ReportBundleProjectionError,
     build_report_bundle_manifest,
@@ -487,17 +488,81 @@ def test_shared_hygiene_excludes_probe_hidden_symlink_and_nested_workspace(
     (nested / "briefloop.db").write_bytes(b"nested")
     nested_member = nested / "member.md"
     nested_member.write_text("nested\n", encoding="utf-8")
+    residue = ws / "output" / "delivery" / "staging.tmp" / "brief.md"
+    residue.parent.mkdir()
+    residue.write_text("residue\n", encoding="utf-8")
 
     decisions = {
         path: classify_workspace_member(ws, path, surface="bundle")
-        for path in (hidden, probe, link, nested_member)
+        for path in (hidden, probe, link, nested_member, residue)
     }
 
     assert decisions[hidden].reason_code == "workspace_member_hidden"
     assert decisions[probe].reason_code == "workspace_member_publication_probe"
     assert decisions[link].reason_code == "workspace_member_symlink"
     assert decisions[nested_member].reason_code == "workspace_member_nested_workspace"
+    assert decisions[residue].reason_code == "workspace_member_packaging_residue"
     assert all(item.status == "exclude" for item in decisions.values())
+
+
+def test_audit_bundle_never_reads_or_archives_symlink_target_bytes(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    private = ws / "input" / "sources" / "private.txt"
+    private.parent.mkdir(parents=True)
+    private.write_text("PRIVATE-TARGET-BYTES\n", encoding="utf-8")
+    semantic = ws / "output" / "intermediate" / "semantic_assessment_report.json"
+    semantic.symlink_to(private)
+
+    manifest = write_report_bundle_manifest(
+        workspace=ws,
+        write_archives=True,
+    )
+
+    excluded = manifest["packaging_hygiene"]["excluded_artifacts"]
+    assert {
+        (item["path"], item["reason"])
+        for item in excluded
+    } >= {
+        (
+            "output/intermediate/semantic_assessment_report.json",
+            "workspace_member_symlink",
+        )
+    }
+    with zipfile.ZipFile(ws / "output" / "audit_bundle.zip") as archive:
+        names = archive.namelist()
+        assert not any("semantic_assessment_report" in name for name in names)
+        assert b"PRIVATE-TARGET-BYTES" not in b"".join(
+            archive.read(name) for name in names
+        )
+
+
+def test_audit_archive_rejects_member_swapped_after_manifest(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    semantic = ws / "output" / "intermediate" / "semantic_assessment_report.json"
+    semantic.write_text('{"status":"advisory"}\n', encoding="utf-8")
+    manifest = build_report_bundle_manifest(workspace=ws)
+    private = ws / "input" / "sources" / "private.txt"
+    private.parent.mkdir(parents=True)
+    private.write_text("PRIVATE-SWAPPED-BYTES\n", encoding="utf-8")
+    semantic.unlink()
+    semantic.symlink_to(private)
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="bundle member is not hygienic",
+    ):
+        bundle_projection._write_bundle_archives(ws, manifest)
+
+    archive = ws / "output" / "audit_bundle.zip"
+    if archive.exists():
+        with zipfile.ZipFile(archive) as handle:
+            assert b"PRIVATE-SWAPPED-BYTES" not in b"".join(
+                handle.read(name) for name in handle.namelist()
+            )
 
 
 def test_report_bundle_manifest_preserves_utf8_paths_with_ascii_fallback(tmp_path: Path) -> None:

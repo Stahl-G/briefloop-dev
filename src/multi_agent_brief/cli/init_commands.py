@@ -547,7 +547,13 @@ def _init_workspace(args: argparse.Namespace) -> int:
     if error_code := _existing_store_init_error(target):
         print(f"[error] {error_code}")
         return 1
-    create_workspace(target, profile, force=args.force)
+    from multi_agent_brief.product.workspace_hygiene import NestedWorkspaceTargetError
+
+    try:
+        create_workspace(target, profile, force=args.force)
+    except NestedWorkspaceTargetError as exc:
+        print(f"[error] {exc.code}")
+        return 1
     from multi_agent_brief.runtime_host_v2.initialization import (
         RuntimeHostError,
         WorkspaceBootstrap,

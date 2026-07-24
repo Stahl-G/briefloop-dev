@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -234,13 +236,30 @@ def _write_zip_from_records(
                 raise ReportBundleProjectionError(
                     f"bundle member is not hygienic: {rel}: {decision.reason_code}"
                 )
-            source = _resolve_workspace_path(workspace, rel)
+            verified_rel, payload = _read_verified_workspace_member(
+                workspace,
+                rel,
+                surface="bundle",
+            )
+            if verified_rel != rel:
+                raise ReportBundleProjectionError(
+                    f"bundle member path changed during verification: {rel}"
+                )
+            expected_sha = str(record.get("sha256") or "")
+            expected_size = record.get("size_bytes")
+            if (
+                hashlib.sha256(payload).hexdigest() != expected_sha
+                or len(payload) != expected_size
+            ):
+                raise ReportBundleProjectionError(
+                    f"bundle member changed after manifest projection: {rel}"
+                )
             arcname = _archive_member_name(rel, surface=surface)
             info = zipfile.ZipInfo(arcname)
             info.date_time = (1980, 1, 1, 0, 0, 0)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
-            zf.writestr(info, source.read_bytes())
+            zf.writestr(info, payload)
 
 
 def _write_bundle_readme(zf: zipfile.ZipFile, *, surface: str) -> None:
@@ -419,22 +438,25 @@ def _audit_records(
     ]
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
-    delivery_root = (workspace / "output" / "delivery").resolve()
     for role, path in candidates:
-        if path is None or not path.exists() or not path.is_file():
+        if path is None:
             continue
-        resolved = path.resolve()
         try:
-            resolved.relative_to(delivery_root)
+            path.lstat()
+        except FileNotFoundError:
             continue
-        except ValueError:
-            pass
-        rel = _workspace_relative(workspace, resolved)
-        if rel in seen:
+        except OSError:
+            decision = classify_workspace_member(workspace, path, surface="audit")
+            _record_hygiene_exclusion(
+                decision.relative_path or "outside_workspace",
+                hygiene=hygiene,
+                surface="audit",
+                reason=decision.reason_code or "workspace_member_unreadable",
+            )
             continue
         decision = classify_workspace_member(
             workspace,
-            resolved,
+            path,
             surface="audit",
         )
         if decision.status != "include":
@@ -445,8 +467,31 @@ def _audit_records(
                 reason=decision.reason_code or "workspace_member_excluded",
             )
             continue
+        if decision.relative_path is None:
+            continue
+        rel = decision.relative_path
+        if rel.startswith("output/delivery/") or rel in seen:
+            continue
+        try:
+            verified_rel, payload = _read_verified_workspace_member(
+                workspace,
+                path,
+                surface="audit",
+            )
+        except ReportBundleProjectionError:
+            _record_hygiene_exclusion(
+                rel,
+                hygiene=hygiene,
+                surface="audit",
+                reason="workspace_member_identity_changed",
+            )
+            continue
+        if verified_rel != rel:
+            raise ReportBundleProjectionError(
+                f"audit member path changed during verification: {rel}"
+            )
         seen.add(rel)
-        records.append(_artifact_record(workspace, resolved, role=role))
+        records.append(_artifact_record_from_bytes(rel, payload, role=role))
     return records
 
 
@@ -651,16 +696,106 @@ def _hash_for_path(
 
 
 def _artifact_record(workspace: Path, path: Path, *, role: str) -> dict[str, Any]:
+    rel, payload = _read_verified_workspace_member(
+        workspace,
+        path,
+        surface="bundle",
+    )
+    return _artifact_record_from_bytes(rel, payload, role=role)
+
+
+def _artifact_record_from_bytes(
+    relative_path: str,
+    payload: bytes,
+    *,
+    role: str,
+) -> dict[str, Any]:
     record = {
-        "path": _workspace_relative(workspace, path),
+        "path": relative_path,
         "role": role,
-        "sha256": _sha256_file(path),
-        "size_bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
     }
-    fallback = _ascii_fallback_name(path.name)
-    if fallback != path.name:
+    name = Path(relative_path).name
+    fallback = _ascii_fallback_name(name)
+    if fallback != name:
         record["ascii_fallback_name"] = fallback
     return record
+
+
+def _read_verified_workspace_member(
+    workspace: Path,
+    candidate: str | Path,
+    *,
+    surface: str,
+) -> tuple[str, bytes]:
+    """Read one classified member through retained no-follow directory handles."""
+
+    decision = classify_workspace_member(workspace, candidate, surface=surface)
+    if decision.status != "include" or decision.relative_path is None:
+        raise ReportBundleProjectionError(
+            "workspace member is not hygienic: "
+            f"{decision.relative_path or 'outside_workspace'}: "
+            f"{decision.reason_code or 'workspace_member_excluded'}"
+        )
+    root = workspace.expanduser().resolve(strict=True)
+    parts = Path(decision.relative_path).parts
+    directory_fd = os.open(
+        root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        leaf_fd = os.open(
+            parts[-1],
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            before = os.fstat(leaf_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError("workspace member is not regular")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(leaf_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(leaf_fd)
+            if (
+                (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or before.st_size != after.st_size
+            ):
+                raise OSError("workspace member changed during read")
+        finally:
+            os.close(leaf_fd)
+    except OSError as exc:
+        raise ReportBundleProjectionError(
+            f"workspace member is unreadable or changed: {decision.relative_path}"
+        ) from exc
+    finally:
+        os.close(directory_fd)
+    payload = b"".join(chunks)
+    if len(payload) != before.st_size:
+        raise ReportBundleProjectionError(
+            f"workspace member changed during read: {decision.relative_path}"
+        )
+    return decision.relative_path, payload
 
 
 def _record_hygiene_exclusion(
