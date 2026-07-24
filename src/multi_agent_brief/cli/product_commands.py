@@ -157,7 +157,14 @@ def register_packs(subparsers: argparse._SubParsersAction) -> None:
 
     bundle_parser = actions.add_parser(
         "bundle",
-        help="Write a delivery/audit bundle projection for a finalized workspace.",
+        help=(
+            "Write a local bundle projection when safe local publication "
+            "capability is available."
+        ),
+        description=(
+            "Write a local bundle projection when safe local publication "
+            "capability is available."
+        ),
     )
     bundle_parser.add_argument(
         "--workspace", required=True, help="Path to workspace directory."
@@ -169,7 +176,10 @@ def register_packs(subparsers: argparse._SubParsersAction) -> None:
     bundle_parser.add_argument(
         "--write-archives",
         action="store_true",
-        help="Write clean delivery_bundle.zip and audit_bundle.zip from the manifest artifacts.",
+        help=(
+            "Also write clean delivery_bundle.zip and audit_bundle.zip; "
+            "unsupported platforms fail before writes."
+        ),
     )
     bundle_parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON."
@@ -253,12 +263,15 @@ def register_quality(subparsers: argparse._SubParsersAction) -> None:
         "--json", action="store_true", help="Emit machine-readable JSON."
     )
 
+    html_help = (
+        "Write a local, static, read-only four-tab view: verified "
+        "local-finalized Brief, deterministic Quality, optional advisory "
+        "LAJ (NOT MEASURED), and unavailable Improvement."
+    )
     html_parser = actions.add_parser(
         "html",
-        help=(
-            "Write the read-only three-page brief HTML (quality / semantic "
-            "review / improvement) as a self-contained static export."
-        ),
+        help=html_help,
+        description=html_help,
     )
     html_parser.add_argument(
         "--workspace", required=True, help="Path to workspace directory."

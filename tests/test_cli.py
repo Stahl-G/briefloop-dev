@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
+import sys
+import tempfile
 
+import pytest
 import yaml
 
 from multi_agent_brief.cli.main import build_parser, main
@@ -65,6 +69,153 @@ def test_cli_init_creates_workspace(tmp_path, capsys):
     assert "input/context" in output
     assert "简报示例 Markdown" in output
     assert "Claim Ledger" in output
+
+
+def test_cli_init_rejects_nested_workspace_before_any_write(tmp_path, capsys):
+    outer = tmp_path / "outer"
+    assert main(complete_init_args(outer)) == 0
+    capsys.readouterr()
+    before = {
+        path.relative_to(outer).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in outer.rglob("*")
+        if path.is_file()
+    }
+    nested = outer / "nested"
+
+    assert main(complete_init_args(nested, language="en-US")) == 1
+
+    assert capsys.readouterr().out.strip() == "[error] workspace_target_nested"
+    assert not nested.exists()
+    after = {
+        path.relative_to(outer).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in outer.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_cli_init_rejects_symlink_alias_into_existing_workspace_before_writes(
+    tmp_path,
+    capsys,
+):
+    outer = tmp_path / "outer"
+    assert main(complete_init_args(outer)) == 0
+    capsys.readouterr()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(outer / "input" / "context", target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+    before = {
+        path.relative_to(outer).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in outer.rglob("*")
+        if path.is_file()
+    }
+
+    assert main(complete_init_args(alias / "nested", language="en-US")) == 1
+
+    assert capsys.readouterr().out.strip() == "[error] workspace_target_nested"
+    assert not (outer / "input" / "context" / "nested").exists()
+    after = {
+        path.relative_to(outer).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in outer.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_cli_init_rejects_lexically_nested_alias_that_points_outward(
+    tmp_path,
+    capsys,
+):
+    outer = tmp_path / "outer"
+    assert main(complete_init_args(outer)) == 0
+    capsys.readouterr()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = outer / "input" / "context" / "outward"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    assert main(complete_init_args(alias / "nested", language="en-US")) == 1
+
+    assert capsys.readouterr().out.strip() == "[error] workspace_target_nested"
+    assert not (outside / "nested").exists()
+
+
+def test_cli_init_uses_canonical_non_nested_alias_target(tmp_path, capsys):
+    canonical_parent = tmp_path / "canonical"
+    canonical_parent.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(canonical_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    assert main(complete_init_args(alias / "workspace")) == 0
+
+    canonical_target = canonical_parent / "workspace"
+    output = capsys.readouterr().out
+    assert (canonical_target / "config.yaml").exists()
+    assert str(canonical_target) in output
+    assert str(alias / "workspace") not in output
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS /tmp alias row")
+def test_cli_init_allows_macos_tmp_alias_for_non_nested_target(capsys):
+    routed_parent = Path(tempfile.mkdtemp(prefix="briefloop-m5-", dir="/tmp"))
+    canonical_parent = routed_parent.resolve()
+    try:
+        assert main(complete_init_args(routed_parent / "workspace")) == 0
+        output = capsys.readouterr().out
+        assert (canonical_parent / "workspace" / "config.yaml").exists()
+        assert str(canonical_parent / "workspace") in output
+    finally:
+        shutil.rmtree(canonical_parent, ignore_errors=True)
+
+
+def test_quality_html_help_states_the_truthful_four_tab_boundary(capsys):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["quality", "html", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    normalized = " ".join(output.split())
+    assert "local, static, read-only four-tab view" in normalized
+    assert "local-finalized Brief" in normalized
+    assert "deterministic Quality" in normalized
+    assert "optional advisory LAJ (NOT MEASURED)" in normalized
+    assert "unavailable Improvement" in normalized
+    assert "three-page" not in normalized
+
+
+def test_packs_bundle_help_states_safe_publication_boundary(capsys):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["packs", "bundle", "--help"])
+
+    assert exc.value.code == 0
+    normalized = " ".join(capsys.readouterr().out.split())
+    assert "safe local publication capability" in normalized
+    assert "unsupported platforms fail before writes" in normalized
+    assert "delivery authority" not in normalized
 
 
 def test_cli_init_can_configure_initial_news_backfill(tmp_path):
