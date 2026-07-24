@@ -64,6 +64,16 @@ def _resolve_cli(
             path = current_directory / path
         return str(path.resolve())
 
+    def freeze_explicit_override(override: str) -> str:
+        path = Path(override)
+        # Anchor relative paths without resolving their final symlink identity.
+        is_relative_path = not path.is_absolute() and (
+            override.startswith(".") or "/" in override or "\\" in override
+        )
+        if not is_relative_path:
+            return override
+        return str(current_directory / path)
+
     for override_name in _CLI_OVERRIDE_NAMES:
         if override_name not in current_environ:
             continue
@@ -77,8 +87,8 @@ def _resolve_cli(
                 override_name=override_name,
             )
         return _CliResolution(
-            # `which` validates an override; it must not rewrite operator intent.
-            command=override,
+            # `which` validates an override; it must not select a different executable.
+            command=freeze_explicit_override(override),
             source="explicit_override",
             reason_code=None,
             override_name=override_name,

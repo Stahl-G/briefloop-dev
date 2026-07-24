@@ -375,6 +375,62 @@ def test_cli_resolver_preserves_explicit_symlink_and_bare_command_identity(tmp_p
     assert bare_resolution.command == "briefloop-override"
 
 
+def test_relative_explicit_override_is_frozen_before_consumer_cwd_changes(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    onboarding = workspace / "onboarding.json"
+    onboarding.write_text("{}\n", encoding="utf-8")
+    caller = tmp_path / "caller"
+    override_path = caller / "bin" / "briefloop"
+    override_path.parent.mkdir(parents=True)
+    target = caller / "briefloop-target"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    override_path.symlink_to(target)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    configured_override = "./bin/briefloop"
+    expected_command = str(override_path)
+    original_resolve = tools._resolve_cli
+    commands = []
+
+    def resolve(*, repo_root, **_kwargs):
+        return original_resolve(
+            repo_root=repo_root,
+            environ={"BRIEFLOOP_BIN": configured_override},
+            which=_which_from({configured_override: expected_command}),
+            resolution_cwd=caller,
+        )
+
+    def fake_run(cmd, cwd=None, timeout=300):
+        del timeout
+        commands.append((cmd, cwd))
+        return {"ok": True, "returncode": 0, "stdout": "", "stderr": "", "command": cmd}
+
+    monkeypatch.setattr(tools, "_find_repo_root", lambda: repo_root)
+    monkeypatch.setattr(tools, "_find_workspace_dirs", lambda _root: [])
+    monkeypatch.setattr(tools, "_resolve_cli", resolve)
+    monkeypatch.setattr(tools, "_run", fake_run)
+
+    initialized = json.loads(
+        tools.init_workspace(
+            {
+                "workspace": str(workspace),
+                "onboarding_path": str(onboarding),
+            }
+        )
+    )
+    doctor = json.loads(tools.env_doctor({}))
+    handoff = json.loads(tools.run_handoff({"workspace": str(workspace)}))
+
+    assert initialized["command"][0] == expected_command
+    assert doctor["mabw_bin"] == expected_command
+    assert handoff["command"][0] == expected_command
+    assert [cmd[0] for cmd, _cwd in commands] == [expected_command] * 3
+    assert commands[-1][1] == str(repo_root)
+
+
 def test_cli_resolver_fails_closed_before_any_fallback_for_first_override():
     calls = []
 
@@ -660,6 +716,10 @@ def test_copied_plugin_resolver_matches_source_for_identity_and_fallback(
         (
             {"BRIEFLOOP_BIN": "briefloop-override"},
             {"briefloop-override": "/bin/briefloop"},
+        ),
+        (
+            {"BRIEFLOOP_BIN": "./bin/briefloop"},
+            {"./bin/briefloop": str(tmp_path / "bin" / "briefloop")},
         ),
         ({}, {"briefloop": "bin/briefloop"}),
         ({"BRIEFLOOP_BIN": ""}, {}),
