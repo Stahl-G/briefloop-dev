@@ -20,6 +20,7 @@ from multi_agent_brief.control_store import SQLiteControlStore
 from multi_agent_brief.control_store.serialization import canonical_fingerprint
 from multi_agent_brief.core_run_v2.verifier import CoreRunDomainVerifier
 from multi_agent_brief.runtime_host_v2 import RuntimeHostError
+from multi_agent_brief.runtime_host_v2.contracts import LocalRunGateSummary
 from multi_agent_brief.runtime_host_v2.initialization import initialize_or_open_runtime
 from multi_agent_brief.runtime_host_v2.projections import (
     build_local_run_presentation,
@@ -451,6 +452,24 @@ def test_local_presentation_uses_one_loaded_history_without_head_reopen(
     assert presentation.view_state == "setup"
     assert presentation.reader_brief.state == "unavailable"
     assert presentation.presentation.status == "not_requested"
+
+
+@pytest.mark.parametrize("status", ["pass", "fail", "warning"])
+def test_local_presentation_gate_summary_preserves_every_store_status(
+    status: str,
+) -> None:
+    summary = LocalRunGateSummary.model_validate(
+        {
+            "gate_id": "final_abstract_quality",
+            "evaluation_id": f"EVAL-{status}",
+            "stage_id": "auditor",
+            "status": status,
+            "blocking": status == "fail",
+        },
+        strict=True,
+    )
+
+    assert summary.status == status
 
 
 def _delivery_result_ready_host(

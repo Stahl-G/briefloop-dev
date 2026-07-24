@@ -22,6 +22,15 @@ class WorkspaceMemberDecision:
     relative_path: str | None
 
 
+class NestedWorkspaceTargetError(RuntimeError):
+    """Raised before init writes beneath an existing BriefLoop workspace."""
+
+    code = "workspace_target_nested"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
 def is_briefloop_workspace_root(path: Path) -> bool:
     """Recognize Store authority or the complete strict pre-Store marker set."""
 
@@ -73,22 +82,21 @@ def classify_workspace_member(
         )
     if not relative.parts:
         return WorkspaceMemberDecision("exclude", "workspace_member_not_regular", ".")
-    name = relative.name
-    lower = name.lower()
-    if (
-        name in _JUNK_NAMES
-        or name.startswith("~$")
-        or name.startswith(".~lock.")
-        or name.endswith(("~", "#"))
-        or lower in {item.lower() for item in _JUNK_NAMES}
-        or lower.endswith(_JUNK_SUFFIXES)
-    ):
-        return WorkspaceMemberDecision(
-            "exclude",
-            "workspace_member_packaging_residue",
-            relative.as_posix(),
-        )
     for index, part in enumerate(relative.parts):
+        lower = part.lower()
+        if (
+            part in _JUNK_NAMES
+            or part.startswith("~$")
+            or part.startswith(".~lock.")
+            or part.endswith(("~", "#"))
+            or lower in {item.lower() for item in _JUNK_NAMES}
+            or lower.endswith(_JUNK_SUFFIXES)
+        ):
+            return WorkspaceMemberDecision(
+                "exclude",
+                "workspace_member_packaging_residue",
+                relative.as_posix(),
+            )
         if part.startswith(".briefloop-pub-probe-"):
             return WorkspaceMemberDecision(
                 "exclude",
@@ -149,6 +157,7 @@ def classify_workspace_member(
 
 
 __all__ = [
+    "NestedWorkspaceTargetError",
     "WorkspaceMemberDecision",
     "classify_workspace_member",
     "is_briefloop_workspace_root",

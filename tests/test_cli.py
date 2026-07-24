@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from multi_agent_brief.cli.main import build_parser, main
@@ -65,6 +66,52 @@ def test_cli_init_creates_workspace(tmp_path, capsys):
     assert "input/context" in output
     assert "简报示例 Markdown" in output
     assert "Claim Ledger" in output
+
+
+def test_cli_init_rejects_nested_workspace_before_any_write(tmp_path, capsys):
+    outer = tmp_path / "outer"
+    assert main(complete_init_args(outer)) == 0
+    capsys.readouterr()
+    before = {
+        path.relative_to(outer).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in outer.rglob("*")
+        if path.is_file()
+    }
+    nested = outer / "nested"
+
+    assert main(complete_init_args(nested, language="en-US")) == 1
+
+    assert capsys.readouterr().out.strip() == "[error] workspace_target_nested"
+    assert not nested.exists()
+    after = {
+        path.relative_to(outer).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in outer.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_quality_html_help_states_the_truthful_four_tab_boundary(capsys):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["quality", "html", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    normalized = " ".join(output.split())
+    assert "local, static, read-only four-tab view" in normalized
+    assert "local-finalized Brief" in normalized
+    assert "deterministic Quality" in normalized
+    assert "optional advisory LAJ (NOT MEASURED)" in normalized
+    assert "unavailable Improvement" in normalized
+    assert "three-page" not in normalized
 
 
 def test_cli_init_can_configure_initial_news_backfill(tmp_path):

@@ -297,7 +297,7 @@ class LocalRunGateSummary(StrictModel):
     gate_id: ContractId
     evaluation_id: ContractId
     stage_id: ContractId
-    status: Literal["pass", "fail"]
+    status: Literal["pass", "fail", "warning"]
     blocking: bool
 
 

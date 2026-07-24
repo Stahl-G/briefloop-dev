@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
+import stat
 from typing import Any, Callable
 import webbrowser
 
@@ -88,22 +90,129 @@ def render_brief_pages_html(data: dict[str, Any]) -> bytes:
     return (html + "\n").encode("utf-8")
 
 
-def _replace_projection(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+def _replace_projection(workspace: Path, payload: bytes) -> Path:
+    root_fd = -1
+    output_fd = -1
+    temporary = f".brief_pages.html.tmp-{secrets.token_hex(16)}"
+    target = OUTPUT_RELATIVE_PATH.name
     try:
-        with temporary.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        if _sha256_bytes(path.read_bytes()) != _sha256_bytes(payload):
+        root_fd = os.open(
+            workspace,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.mkdir("output", 0o755, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        output_info = os.stat("output", dir_fd=root_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(output_info.st_mode):
+            raise OSError("brief HTML output parent is not a directory")
+        output_identity = (output_info.st_dev, output_info.st_ino)
+        output_fd = os.open(
+            "output",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=root_fd,
+        )
+        opened_output = os.fstat(output_fd)
+        if (opened_output.st_dev, opened_output.st_ino) != output_identity:
+            raise OSError("brief HTML output parent changed")
+        try:
+            existing = os.stat(target, dir_fd=output_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise OSError("brief HTML target is not a regular file")
+        temp_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=output_fd,
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    raise OSError("brief HTML short write")
+                view = view[written:]
+            os.fsync(temp_fd)
+            created = os.fstat(temp_fd)
+            if not stat.S_ISREG(created.st_mode) or created.st_size != len(payload):
+                raise OSError("brief HTML temporary verification failed")
+        finally:
+            os.close(temp_fd)
+        current_output = os.stat("output", dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current_output.st_mode)
+            or (current_output.st_dev, current_output.st_ino) != output_identity
+        ):
+            raise OSError("brief HTML output parent changed")
+        if existing is not None:
+            current_target = os.stat(target, dir_fd=output_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current_target.st_mode)
+                or (current_target.st_dev, current_target.st_ino)
+                != (existing.st_dev, existing.st_ino)
+            ):
+                raise OSError("brief HTML target changed")
+        else:
+            try:
+                os.stat(target, dir_fd=output_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OSError("brief HTML target appeared")
+        os.replace(
+            temporary,
+            target,
+            src_dir_fd=output_fd,
+            dst_dir_fd=output_fd,
+        )
+        final_fd = os.open(
+            target,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=output_fd,
+        )
+        try:
+            final_info = os.fstat(final_fd)
+            if not stat.S_ISREG(final_info.st_mode):
+                raise OSError("brief HTML final target is not regular")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(final_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(final_fd)
+        if _sha256_bytes(b"".join(chunks)) != _sha256_bytes(payload):
             raise OSError("brief HTML verification failed")
+        os.fsync(output_fd)
     except OSError as exc:
         try:
-            temporary.unlink(missing_ok=True)
+            if output_fd >= 0:
+                os.unlink(temporary, dir_fd=output_fd)
         except OSError:
             pass
         raise BriefHtmlError("brief_html_write_failed") from exc
+    finally:
+        if output_fd >= 0:
+            os.close(output_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+    return workspace / OUTPUT_RELATIVE_PATH
 
 
 def write_brief_pages(
@@ -118,9 +227,7 @@ def write_brief_pages(
     root = Path(workspace).expanduser().resolve()
     data = build_brief_pages_data(root, laj_view_path=laj_view_path)
     rendered = render_brief_pages_html(data)
-    target = root / OUTPUT_RELATIVE_PATH
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _replace_projection(target, rendered)
+    target = _replace_projection(root, rendered)
     opened = False
     reason = "brief_html_headless"
     if open_browser:
