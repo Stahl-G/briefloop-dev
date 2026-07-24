@@ -32,6 +32,10 @@ EXPECTED_TEMPLATE_IDS = {
     "management_monthly",
     "solar_industry_periodic",
 }
+requires_safe_bundle_publication = pytest.mark.skipif(
+    not bundle_projection._supports_safe_bundle_publication(),
+    reason="safe local bundle publication capability unavailable",
+)
 
 
 def _finalized_workspace(tmp_path: Path) -> Path:
@@ -264,6 +268,7 @@ def test_report_bundle_manifest_rejects_forged_reader_citation_exposure(tmp_path
         build_report_bundle_manifest(workspace=ws)
 
 
+@requires_safe_bundle_publication
 def test_report_bundle_archives_reject_reader_residue_even_with_matching_hash(tmp_path: Path) -> None:
     ws = _finalized_workspace(tmp_path)
     brief = ws / "output" / "delivery" / "brief.md"
@@ -284,6 +289,7 @@ def test_report_bundle_archives_reject_reader_residue_even_with_matching_hash(tm
     assert not (ws / "output" / "audit_bundle.zip").exists()
 
 
+@requires_safe_bundle_publication
 def test_report_bundle_archives_reject_evidence_span_id_residue(tmp_path: Path) -> None:
     ws = _finalized_workspace(tmp_path)
     brief = ws / "output" / "delivery" / "brief.md"
@@ -505,6 +511,7 @@ def test_shared_hygiene_excludes_probe_hidden_symlink_and_nested_workspace(
     assert all(item.status == "exclude" for item in decisions.values())
 
 
+@requires_safe_bundle_publication
 def test_audit_bundle_never_reads_or_archives_symlink_target_bytes(
     tmp_path: Path,
 ) -> None:
@@ -538,6 +545,7 @@ def test_audit_bundle_never_reads_or_archives_symlink_target_bytes(
         )
 
 
+@requires_safe_bundle_publication
 def test_audit_archive_rejects_member_swapped_after_manifest(
     tmp_path: Path,
 ) -> None:
@@ -688,6 +696,7 @@ def test_report_bundle_manifest_rejects_missing_per_artifact_hash(tmp_path: Path
         raise AssertionError("Expected missing per-artifact hash rejection")
 
 
+@requires_safe_bundle_publication
 def test_packs_bundle_cli_writes_manifest_without_copying_trace_to_delivery(
     tmp_path: Path,
 ) -> None:
@@ -713,6 +722,7 @@ def test_packs_bundle_cli_writes_manifest_without_copying_trace_to_delivery(
     ]
 
 
+@requires_safe_bundle_publication
 def test_packs_bundle_cli_writes_clean_archives_from_manifest(
     tmp_path: Path,
 ) -> None:
@@ -815,6 +825,7 @@ def test_packs_bundle_cli_writes_clean_archives_from_manifest(
         "output/report_bundle_manifest.json",
     ),
 )
+@requires_safe_bundle_publication
 def test_bundle_projection_preserves_symlinked_final_targets(
     tmp_path: Path,
     relative_target: str,
@@ -840,6 +851,7 @@ def test_bundle_projection_preserves_symlinked_final_targets(
     assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
 
 
+@requires_safe_bundle_publication
 def test_bundle_projection_rejects_replaced_output_parent_without_writing_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -870,6 +882,7 @@ def test_bundle_projection_rejects_replaced_output_parent_without_writing_replac
     assert not list((ws / "owned-output").glob(".briefloop-bundle-*.tmp"))
 
 
+@requires_safe_bundle_publication
 def test_bundle_projection_rejects_symlinked_manifest_parent_without_external_write(
     tmp_path: Path,
 ) -> None:
@@ -894,6 +907,7 @@ def test_bundle_projection_rejects_symlinked_manifest_parent_without_external_wr
     assert list(outside.iterdir()) == []
 
 
+@requires_safe_bundle_publication
 def test_bundle_projection_preserves_final_leaf_that_appears_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -929,6 +943,7 @@ def test_bundle_projection_preserves_final_leaf_that_appears_after_preflight(
     assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
 
 
+@requires_safe_bundle_publication
 def test_bundle_projection_preserves_final_leaf_replaced_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -965,6 +980,7 @@ def test_bundle_projection_preserves_final_leaf_replaced_after_preflight(
     assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
 
 
+@requires_safe_bundle_publication
 def test_bundle_projection_preserves_manifest_leaf_that_appears_after_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -992,6 +1008,125 @@ def test_bundle_projection_preserves_manifest_leaf_that_appears_after_preflight(
 
     assert target.read_bytes() == b"unknown manifest"
     assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+@pytest.mark.parametrize("function_name", ("open", "stat", "mkdir", "unlink"))
+def test_bundle_publication_capability_requires_every_retained_relative_primitive(
+    monkeypatch: pytest.MonkeyPatch,
+    function_name: str,
+) -> None:
+    missing = getattr(bundle_projection.os, function_name)
+    monkeypatch.setattr(
+        bundle_projection.os,
+        "supports_dir_fd",
+        bundle_projection.os.supports_dir_fd - {missing},
+    )
+
+    assert bundle_projection._supports_safe_bundle_publication() is False
+
+
+def test_bundle_publication_capability_requires_relative_replace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def path_only_replace(source: str, target: str) -> None:
+        del source, target
+
+    monkeypatch.setattr(bundle_projection.os, "replace", path_only_replace)
+
+    assert bundle_projection._supports_safe_bundle_publication() is False
+
+
+def test_bundle_publication_unsupported_is_zero_write_and_preserves_identities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    output = ws / "output"
+    sentinels = {
+        output / "report_bundle_manifest.json": b"existing manifest",
+        output / "delivery_bundle.zip": b"existing delivery",
+        output / "audit_bundle.zip": b"existing audit",
+        output / ".briefloop-bundle-existing.tmp": b"existing temp-like file",
+    }
+    for path, payload in sentinels.items():
+        path.write_bytes(payload)
+    before = {
+        path: (path.read_bytes(), path.lstat().st_dev, path.lstat().st_ino)
+        for path in sentinels
+    }
+    before_names = sorted(path.relative_to(ws).as_posix() for path in ws.rglob("*"))
+    monkeypatch.setattr(
+        bundle_projection,
+        "_supports_safe_bundle_publication",
+        lambda: False,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="^bundle_projection_publication_unsupported$",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert {
+        path: (path.read_bytes(), path.lstat().st_dev, path.lstat().st_ino)
+        for path in sentinels
+    } == before
+    assert sorted(path.relative_to(ws).as_posix() for path in ws.rglob("*")) == before_names
+
+
+def test_bundle_publication_unsupported_does_not_create_custom_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "projection" / "report_bundle_manifest.json"
+    monkeypatch.setattr(
+        bundle_projection,
+        "_supports_safe_bundle_publication",
+        lambda: False,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="^bundle_projection_publication_unsupported$",
+    ):
+        write_report_bundle_manifest(workspace=ws, output_path=target)
+
+    assert not target.parent.exists()
+
+
+def test_bundle_manifest_pure_build_remains_portable_when_publication_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    before = {
+        path.relative_to(ws).as_posix(): (
+            path.read_bytes(),
+            path.lstat().st_dev,
+            path.lstat().st_ino,
+        )
+        for path in ws.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setattr(
+        bundle_projection,
+        "_supports_safe_bundle_publication",
+        lambda: False,
+    )
+
+    manifest = build_report_bundle_manifest(workspace=ws)
+
+    assert manifest["schema_version"] == "briefloop.report_bundle_manifest.v1"
+    assert {
+        path.relative_to(ws).as_posix(): (
+            path.read_bytes(),
+            path.lstat().st_dev,
+            path.lstat().st_ino,
+        )
+        for path in ws.rglob("*")
+        if path.is_file()
+    } == before
 
 
 def test_packs_bundle_rejects_manifest_output_reserved_for_archives(

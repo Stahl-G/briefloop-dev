@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -97,8 +98,8 @@ class _ProjectionParent:
         path: Path,
         root_identity: tuple[int, int],
         chain: tuple[tuple[str, tuple[int, int]], ...],
-        root_fd: int | None,
-        parent_fd: int | None,
+        root_fd: int,
+        parent_fd: int,
     ) -> None:
         self.workspace = workspace
         self.path = path
@@ -109,6 +110,10 @@ class _ProjectionParent:
 
     @classmethod
     def open(cls, workspace: Path, parent: Path) -> "_ProjectionParent":
+        if not _supports_safe_bundle_publication():
+            raise ReportBundleProjectionError(
+                "bundle_projection_publication_unsupported"
+            )
         workspace = workspace.resolve(strict=True)
         parent = Path(os.path.abspath(parent))
         try:
@@ -117,9 +122,7 @@ class _ProjectionParent:
             raise ReportBundleProjectionError(
                 "bundle projection parent must stay inside the workspace."
             ) from exc
-        if _supports_retained_dir_fd():
-            return cls._open_retained(workspace, parent, relative.parts)
-        return cls._open_fallback(workspace, parent, relative.parts)
+        return cls._open_retained(workspace, parent, relative.parts)
 
     @classmethod
     def _open_retained(
@@ -187,49 +190,13 @@ class _ProjectionParent:
                 "bundle projection parent is unavailable."
             ) from exc
 
-    @classmethod
-    def _open_fallback(
-        cls,
-        workspace: Path,
-        parent: Path,
-        parts: tuple[str, ...],
-    ) -> "_ProjectionParent":
-        try:
-            root_info = workspace.lstat()
-            if not stat.S_ISDIR(root_info.st_mode) or workspace.is_symlink():
-                raise OSError("workspace root is not a directory")
-            chain: list[tuple[str, tuple[int, int]]] = []
-            current = workspace
-            for part in parts:
-                current = current / part
-                try:
-                    current.mkdir()
-                except FileExistsError:
-                    pass
-                observed = current.lstat()
-                if not stat.S_ISDIR(observed.st_mode) or current.is_symlink():
-                    raise OSError("bundle projection parent is not a directory")
-                chain.append((part, (observed.st_dev, observed.st_ino)))
-            return cls(
-                workspace=workspace,
-                path=parent,
-                root_identity=(root_info.st_dev, root_info.st_ino),
-                chain=tuple(chain),
-                root_fd=None,
-                parent_fd=None,
-            )
-        except OSError as exc:
-            raise ReportBundleProjectionError(
-                "bundle projection parent is unavailable."
-            ) from exc
-
     def close(self) -> None:
-        if self.parent_fd is not None:
+        if self.parent_fd >= 0:
             os.close(self.parent_fd)
-            self.parent_fd = None
-        if self.root_fd is not None:
+            self.parent_fd = -1
+        if self.root_fd >= 0:
             os.close(self.root_fd)
-            self.root_fd = None
+            self.root_fd = -1
 
     def __enter__(self) -> "_ProjectionParent":
         return self
@@ -246,18 +213,6 @@ class _ProjectionParent:
                 or (root_live.st_dev, root_live.st_ino) != self.root_identity
             ):
                 raise OSError("workspace root changed")
-            if self.root_fd is None:
-                current = self.workspace
-                for part, identity in self.chain:
-                    current = current / part
-                    observed = current.lstat()
-                    if (
-                        not stat.S_ISDIR(observed.st_mode)
-                        or current.is_symlink()
-                        or (observed.st_dev, observed.st_ino) != identity
-                    ):
-                        raise OSError("bundle projection parent changed")
-                return
             current_fd = os.dup(self.root_fd)
             try:
                 for part, identity in self.chain:
@@ -287,32 +242,20 @@ class _ProjectionParent:
     def observe(self, leaf: str) -> _LeafObservation:
         _validate_projection_leaf(leaf)
         try:
-            if self.parent_fd is None:
-                path = self.path / leaf
-                observed = path.lstat()
-                if path.is_symlink() or not stat.S_ISREG(observed.st_mode):
-                    return _LeafObservation("unsafe")
-                fd = os.open(
-                    path,
-                    os.O_RDONLY
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0),
-                )
-            else:
-                observed = os.stat(
-                    leaf,
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-                if not stat.S_ISREG(observed.st_mode):
-                    return _LeafObservation("unsafe")
-                fd = os.open(
-                    leaf,
-                    os.O_RDONLY
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0),
-                    dir_fd=self.parent_fd,
-                )
+            observed = os.stat(
+                leaf,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(observed.st_mode):
+                return _LeafObservation("unsafe")
+            fd = os.open(
+                leaf,
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=self.parent_fd,
+            )
         except FileNotFoundError:
             return _LeafObservation("absent")
         except OSError as exc:
@@ -348,10 +291,7 @@ class _ProjectionParent:
                 | getattr(os, "O_CLOEXEC", 0)
             )
             try:
-                if self.parent_fd is None:
-                    fd = os.open(self.path / leaf, flags, 0o600)
-                else:
-                    fd = os.open(leaf, flags, 0o600, dir_fd=self.parent_fd)
+                fd = os.open(leaf, flags, 0o600, dir_fd=self.parent_fd)
             except FileExistsError:
                 continue
             except OSError as exc:
@@ -369,15 +309,12 @@ class _ProjectionParent:
 
     def replace(self, temporary: str, target: str) -> None:
         try:
-            if self.parent_fd is None:
-                os.replace(self.path / temporary, self.path / target)
-            else:
-                os.replace(
-                    temporary,
-                    target,
-                    src_dir_fd=self.parent_fd,
-                    dst_dir_fd=self.parent_fd,
-                )
+            os.replace(
+                temporary,
+                target,
+                src_dir_fd=self.parent_fd,
+                dst_dir_fd=self.parent_fd,
+            )
         except OSError as exc:
             raise ReportBundleProjectionError(
                 "bundle projection publication failed."
@@ -385,32 +322,22 @@ class _ProjectionParent:
 
     def unlink_if_identity(self, leaf: str, identity: tuple[int, int]) -> None:
         try:
-            if self.parent_fd is None:
-                observed = (self.path / leaf).lstat()
-                if (
-                    stat.S_ISREG(observed.st_mode)
-                    and (observed.st_dev, observed.st_ino) == identity
-                ):
-                    (self.path / leaf).unlink()
-            else:
-                observed = os.stat(
-                    leaf,
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    stat.S_ISREG(observed.st_mode)
-                    and (observed.st_dev, observed.st_ino) == identity
-                ):
-                    os.unlink(leaf, dir_fd=self.parent_fd)
+            observed = os.stat(
+                leaf,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISREG(observed.st_mode)
+                and (observed.st_dev, observed.st_ino) == identity
+            ):
+                os.unlink(leaf, dir_fd=self.parent_fd)
         except FileNotFoundError:
             pass
         except OSError:
             pass
 
     def sync(self) -> None:
-        if self.parent_fd is None:
-            return
         try:
             os.fsync(self.parent_fd)
         except OSError:
@@ -790,10 +717,21 @@ def _write_zip_to_fd(
         stream.flush()
 
 
-def _supports_retained_dir_fd() -> bool:
-    return all(
-        function in os.supports_dir_fd
-        for function in (os.open, os.stat, os.mkdir, os.unlink)
+def _supports_safe_bundle_publication() -> bool:
+    """Return whether the complete retained-relative writer is available."""
+
+    required_dir_fd = (os.open, os.stat, os.mkdir, os.unlink)
+    try:
+        replace_parameters = inspect.signature(os.replace).parameters
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(function in os.supports_dir_fd for function in required_dir_fd)
+        and os.stat in os.supports_follow_symlinks
+        and {"src_dir_fd", "dst_dir_fd"} <= set(replace_parameters)
+        and bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and callable(getattr(os, "fstat", None))
     )
 
 

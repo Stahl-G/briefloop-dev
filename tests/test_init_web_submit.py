@@ -1022,6 +1022,86 @@ def test_target_nested_below_existing_workspace_rejects_before_writes(
     assert _revision(outer) == revision_before
 
 
+def test_init_web_rejects_outside_alias_into_workspace_before_source_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitter = InitWebSubmitter(base_dir=tmp_path)
+    _submit_ok(submitter, _body("REQ-WEB-ALIAS-OUTER", "outer"))
+    outer = tmp_path / "outer"
+    revision_before = _revision(outer)
+    alias = tmp_path / "outside-alias"
+    try:
+        alias.symlink_to(outer / "input" / "context", target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    def forbidden_source_access(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("source handles must not be accessed")
+
+    monkeypatch.setattr(
+        submitter._staging,
+        "canonical_manifest",
+        forbidden_source_access,
+    )
+    body = _body(
+        "REQ-WEB-ALIAS-INTO-WORKSPACE",
+        "outside-alias/nested",
+        source_manifest={"untrusted": True},
+        source_manifest_mode="generated",
+        upload_session_id="never-read",
+        upload_bindings=[{"upload_handle": "never-read"}],
+    )
+
+    with pytest.raises(SubmissionError) as exc_info:
+        submitter.submit(body)
+
+    assert exc_info.value.error_code == "workspace_target_nested"
+    assert exc_info.value.http_status == 409
+    assert not (outer / "input" / "context" / "nested").exists()
+    assert _revision(outer) == revision_before
+
+
+def test_init_web_rejects_lexically_nested_alias_outward_before_source_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitter = InitWebSubmitter(base_dir=tmp_path)
+    _submit_ok(submitter, _body("REQ-WEB-LEXICAL-OUTER", "outer"))
+    outer = tmp_path / "outer"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = outer / "input" / "context" / "outward"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    def forbidden_source_access(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("source handles must not be accessed")
+
+    monkeypatch.setattr(
+        submitter._staging,
+        "canonical_manifest",
+        forbidden_source_access,
+    )
+    body = _body(
+        "REQ-WEB-LEXICAL-OUTWARD",
+        "outer/input/context/outward/nested",
+        source_manifest={"untrusted": True},
+        source_manifest_mode="generated",
+        upload_session_id="never-read",
+        upload_bindings=[{"upload_handle": "never-read"}],
+    )
+
+    with pytest.raises(SubmissionError) as exc_info:
+        submitter.submit(body)
+
+    assert exc_info.value.error_code == "workspace_target_nested"
+    assert exc_info.value.http_status == 409
+    assert not (outside / "nested").exists()
+
+
 def test_direct_create_workspace_rejects_alias_into_existing_workspace(
     tmp_path: Path,
 ) -> None:

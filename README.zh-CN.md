@@ -369,7 +369,8 @@ v0.14.0 完成 SQLite-only 切换，并增加只读交互面：
 
 - `ReportSpec`、`ReportPack`、`ReportTemplate` 和 `PolicyProfile` contract
 - workspace skeleton 和确定性的 PolicyProfile 解析
-- delivery / audit bundle manifest 与干净 bundle archive
+- 实验性的 delivery / audit bundle 数据投影；写入 manifest 和干净 archive
+  需要安全的本地发布能力，否则会在任何写入前 fail closed
 - 支持的 `industry-weekly`、`management-monthly` 和 `document-review` 产品入口
 - 有边界的 `evidence_extract` source/scope 注册、source lock、logical page
   inventory seed 和 text-span seed registry

@@ -205,6 +205,19 @@ def test_quality_html_help_states_the_truthful_four_tab_boundary(capsys):
     assert "three-page" not in normalized
 
 
+def test_packs_bundle_help_states_safe_publication_boundary(capsys):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["packs", "bundle", "--help"])
+
+    assert exc.value.code == 0
+    normalized = " ".join(capsys.readouterr().out.split())
+    assert "safe local publication capability" in normalized
+    assert "unsupported platforms fail before writes" in normalized
+    assert "delivery authority" not in normalized
+
+
 def test_cli_init_can_configure_initial_news_backfill(tmp_path):
     workspace = tmp_path / "ws"
 

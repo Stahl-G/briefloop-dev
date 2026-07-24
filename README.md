@@ -402,7 +402,9 @@ include:
 
 - `ReportSpec`, `ReportPack`, `ReportTemplate`, and `PolicyProfile` contracts
 - workspace skeletons and deterministic PolicyProfile resolution
-- delivery / audit bundle manifests and clean bundle archives
+- experimental delivery / audit bundle data projection; writing its manifest
+  and clean archives requires safe local publication capability and otherwise
+  fails closed before writes
 - supported `industry-weekly`, `management-monthly`, and `document-review`
   product entrypoints
 - bounded `evidence_extract` source/scope registration, source locks, logical
