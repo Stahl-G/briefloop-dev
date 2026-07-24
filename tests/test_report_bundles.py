@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from multi_agent_brief.cli.main import main
+from multi_agent_brief.product import bundle_projection
 from multi_agent_brief.product.bundle_projection import (
     ReportBundleProjectionError,
     build_report_bundle_manifest,
@@ -21,6 +22,7 @@ from multi_agent_brief.product.quality_panel import (
     write_quality_summary,
 )
 from multi_agent_brief.product.template_registry import ReportTemplateRegistry
+from multi_agent_brief.product.workspace_hygiene import classify_workspace_member
 from tests.helpers import sha256_file as _sha256_file
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -409,12 +411,30 @@ def test_report_bundle_manifest_excludes_packaging_junk(tmp_path: Path) -> None:
     ws = _finalized_workspace(tmp_path)
     delivery_junk = ws / "output" / "delivery" / ".DS_Store"
     delivery_junk.write_text("macOS metadata\n", encoding="utf-8")
+    hidden = ws / "output" / "delivery" / ".hidden.md"
+    hidden.write_text("hidden\n", encoding="utf-8")
+    probe = (
+        ws
+        / "output"
+        / "delivery"
+        / ".briefloop-pub-probe-owned"
+        / "member.md"
+    )
+    probe.parent.mkdir()
+    probe.write_text("probe\n", encoding="utf-8")
+    nested = ws / "output" / "delivery" / "nested"
+    nested.mkdir()
+    (nested / "briefloop.db").write_bytes(b"nested")
+    nested_member = nested / "member.md"
+    nested_member.write_text("nested\n", encoding="utf-8")
     trace_junk = ws / "output" / ".~lock.source_appendix_trace.md#"
     trace_junk.write_text("editor lock\n", encoding="utf-8")
     report_path = ws / "output" / "intermediate" / "finalize_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    report["delivery_artifacts"].append("output/delivery/.DS_Store")
-    report["delivery_artifact_sha256"]["output/delivery/.DS_Store"] = _sha256_file(delivery_junk)
+    for path in (delivery_junk, hidden, probe, nested_member):
+        relative = path.relative_to(ws).as_posix()
+        report["delivery_artifacts"].append(relative)
+        report["delivery_artifact_sha256"][relative] = _sha256_file(path)
     report["source_appendix_trace"] = "output/.~lock.source_appendix_trace.md#"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -422,17 +442,127 @@ def test_report_bundle_manifest_excludes_packaging_junk(tmp_path: Path) -> None:
 
     delivery_paths = {item["path"] for item in manifest["delivery_bundle"]["artifacts"]}
     audit_paths = {item["path"] for item in manifest["audit_bundle"]["artifacts"]}
-    excluded_paths = {
-        item["path"]
+    excluded = {
+        item["path"]: item["reason"]
         for item in manifest["packaging_hygiene"]["excluded_artifacts"]
     }
+    assert manifest["packaging_hygiene"]["excluded_artifacts"] == sorted(
+        manifest["packaging_hygiene"]["excluded_artifacts"],
+        key=lambda item: (item["surface"], item["path"], item["reason"]),
+    )
     assert "output/delivery/.DS_Store" not in delivery_paths
+    assert "output/delivery/.hidden.md" not in delivery_paths
+    assert (
+        "output/delivery/.briefloop-pub-probe-owned/member.md"
+        not in delivery_paths
+    )
+    assert "output/delivery/nested/member.md" not in delivery_paths
     assert "output/.~lock.source_appendix_trace.md#" not in audit_paths
     assert manifest["packaging_hygiene"]["status"] == "excluded_packaging_junk"
-    assert excluded_paths == {
-        "output/delivery/.DS_Store",
-        "output/.~lock.source_appendix_trace.md#",
+    assert excluded == {
+        "output/.~lock.source_appendix_trace.md#": (
+            "workspace_member_packaging_residue"
+        ),
+        "output/delivery/.DS_Store": "workspace_member_packaging_residue",
+        "output/delivery/.briefloop-pub-probe-owned/member.md": (
+            "workspace_member_publication_probe"
+        ),
+        "output/delivery/.hidden.md": "workspace_member_hidden",
+        "output/delivery/nested/member.md": "workspace_member_nested_workspace",
     }
+
+
+def test_shared_hygiene_excludes_probe_hidden_symlink_and_nested_workspace(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    hidden = ws / "output" / "delivery" / ".hidden.md"
+    hidden.write_text("hidden\n", encoding="utf-8")
+    probe = ws / "output" / ".briefloop-pub-probe-owned" / "member"
+    probe.parent.mkdir()
+    probe.write_text("probe\n", encoding="utf-8")
+    link = ws / "output" / "delivery" / "linked.md"
+    link.symlink_to(ws / "output" / "delivery" / "brief.md")
+    nested = ws / "output" / "delivery" / "nested"
+    nested.mkdir()
+    (nested / "briefloop.db").write_bytes(b"nested")
+    nested_member = nested / "member.md"
+    nested_member.write_text("nested\n", encoding="utf-8")
+    residue = ws / "output" / "delivery" / "staging.tmp" / "brief.md"
+    residue.parent.mkdir()
+    residue.write_text("residue\n", encoding="utf-8")
+
+    decisions = {
+        path: classify_workspace_member(ws, path, surface="bundle")
+        for path in (hidden, probe, link, nested_member, residue)
+    }
+
+    assert decisions[hidden].reason_code == "workspace_member_hidden"
+    assert decisions[probe].reason_code == "workspace_member_publication_probe"
+    assert decisions[link].reason_code == "workspace_member_symlink"
+    assert decisions[nested_member].reason_code == "workspace_member_nested_workspace"
+    assert decisions[residue].reason_code == "workspace_member_packaging_residue"
+    assert all(item.status == "exclude" for item in decisions.values())
+
+
+def test_audit_bundle_never_reads_or_archives_symlink_target_bytes(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    private = ws / "input" / "sources" / "private.txt"
+    private.parent.mkdir(parents=True)
+    private.write_text("PRIVATE-TARGET-BYTES\n", encoding="utf-8")
+    semantic = ws / "output" / "intermediate" / "semantic_assessment_report.json"
+    semantic.symlink_to(private)
+
+    manifest = write_report_bundle_manifest(
+        workspace=ws,
+        write_archives=True,
+    )
+
+    excluded = manifest["packaging_hygiene"]["excluded_artifacts"]
+    assert {
+        (item["path"], item["reason"])
+        for item in excluded
+    } >= {
+        (
+            "output/intermediate/semantic_assessment_report.json",
+            "workspace_member_symlink",
+        )
+    }
+    with zipfile.ZipFile(ws / "output" / "audit_bundle.zip") as archive:
+        names = archive.namelist()
+        assert not any("semantic_assessment_report" in name for name in names)
+        assert b"PRIVATE-TARGET-BYTES" not in b"".join(
+            archive.read(name) for name in names
+        )
+
+
+def test_audit_archive_rejects_member_swapped_after_manifest(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    semantic = ws / "output" / "intermediate" / "semantic_assessment_report.json"
+    semantic.write_text('{"status":"advisory"}\n', encoding="utf-8")
+    manifest = build_report_bundle_manifest(workspace=ws)
+    private = ws / "input" / "sources" / "private.txt"
+    private.parent.mkdir(parents=True)
+    private.write_text("PRIVATE-SWAPPED-BYTES\n", encoding="utf-8")
+    semantic.unlink()
+    semantic.symlink_to(private)
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="bundle member is not hygienic",
+    ):
+        bundle_projection._write_bundle_archives(ws, manifest)
+
+    archive = ws / "output" / "audit_bundle.zip"
+    if archive.exists():
+        with zipfile.ZipFile(archive) as handle:
+            assert b"PRIVATE-SWAPPED-BYTES" not in b"".join(
+                handle.read(name) for name in handle.namelist()
+            )
 
 
 def test_report_bundle_manifest_preserves_utf8_paths_with_ascii_fallback(tmp_path: Path) -> None:
@@ -675,6 +805,193 @@ def test_packs_bundle_cli_writes_clean_archives_from_manifest(
     rerun_manifest = json.loads((ws / rerun_payload["manifest_path"]).read_text(encoding="utf-8"))
     assert rerun_manifest["bundle_archives"]["delivery"]["sha256"] == first_delivery_sha
     assert rerun_manifest["bundle_archives"]["audit"]["sha256"] == first_audit_sha
+
+
+@pytest.mark.parametrize(
+    "relative_target",
+    (
+        "output/delivery_bundle.zip",
+        "output/audit_bundle.zip",
+        "output/report_bundle_manifest.json",
+    ),
+)
+def test_bundle_projection_preserves_symlinked_final_targets(
+    tmp_path: Path,
+    relative_target: str,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    outside = tmp_path / f"outside-{Path(relative_target).name}"
+    outside.write_bytes(b"external sentinel")
+    target = ws / relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks unavailable")
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="not a replaceable regular file",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.is_symlink()
+    assert outside.read_bytes() == b"external sentinel"
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_rejects_replaced_output_parent_without_writing_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    original_stage = bundle_projection._stage_zip_projection
+    calls = 0
+
+    def stage_and_replace_parent(**kwargs):
+        nonlocal calls
+        staged = original_stage(**kwargs)
+        calls += 1
+        if calls == 1:
+            (ws / "output").rename(ws / "owned-output")
+            (ws / "output").mkdir()
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_zip_projection",
+        stage_and_replace_parent,
+    )
+
+    with pytest.raises(ReportBundleProjectionError):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert list((ws / "output").iterdir()) == []
+    assert not list((ws / "owned-output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_rejects_symlinked_manifest_parent_without_external_write(
+    tmp_path: Path,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    outside = tmp_path / "outside-parent"
+    outside.mkdir()
+    alias = ws / "projection-alias"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="parent is unavailable",
+    ):
+        write_report_bundle_manifest(
+            workspace=ws,
+            output_path="projection-alias/manifest.json",
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_bundle_projection_preserves_final_leaf_that_appears_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "output" / "delivery_bundle.zip"
+    original_stage = bundle_projection._stage_zip_projection
+    calls = 0
+
+    def stage_and_add_unknown_leaf(**kwargs):
+        nonlocal calls
+        staged = original_stage(**kwargs)
+        calls += 1
+        if calls == 1:
+            target.write_bytes(b"unknown replacement")
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_zip_projection",
+        stage_and_add_unknown_leaf,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="target changed",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.read_bytes() == b"unknown replacement"
+    assert not (ws / "output" / "audit_bundle.zip").exists()
+    assert not (ws / "output" / "report_bundle_manifest.json").exists()
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_preserves_final_leaf_replaced_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "output" / "delivery_bundle.zip"
+    target.write_bytes(b"previous projection")
+    original_stage = bundle_projection._stage_zip_projection
+    calls = 0
+
+    def stage_and_replace_leaf(**kwargs):
+        nonlocal calls
+        staged = original_stage(**kwargs)
+        calls += 1
+        if calls == 1:
+            replacement = ws / "output" / "replacement.zip"
+            replacement.write_bytes(b"unknown replacement")
+            replacement.replace(target)
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_zip_projection",
+        stage_and_replace_leaf,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="target changed",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.read_bytes() == b"unknown replacement"
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
+
+
+def test_bundle_projection_preserves_manifest_leaf_that_appears_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _finalized_workspace(tmp_path)
+    target = ws / "output" / "report_bundle_manifest.json"
+    original_stage = bundle_projection._stage_bytes_projection
+
+    def stage_and_add_unknown_leaf(**kwargs):
+        staged = original_stage(**kwargs)
+        target.write_bytes(b"unknown manifest")
+        return staged
+
+    monkeypatch.setattr(
+        bundle_projection,
+        "_stage_bytes_projection",
+        stage_and_add_unknown_leaf,
+    )
+
+    with pytest.raises(
+        ReportBundleProjectionError,
+        match="target changed",
+    ):
+        write_report_bundle_manifest(workspace=ws, write_archives=True)
+
+    assert target.read_bytes() == b"unknown manifest"
+    assert not list((ws / "output").glob(".briefloop-bundle-*.tmp"))
 
 
 def test_packs_bundle_rejects_manifest_output_reserved_for_archives(
