@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from multi_agent_brief.cli.main import build_parser, main
+from multi_agent_brief.cli import product_commands
 
 
 def complete_init_args(workspace, *, language="zh-CN", industry="finance", extra=None):
@@ -205,7 +206,7 @@ def test_quality_html_help_states_the_truthful_four_tab_boundary(capsys):
     assert "three-page" not in normalized
 
 
-def test_packs_bundle_help_states_safe_publication_boundary(capsys):
+def test_packs_bundle_help_states_retired_internal_only_boundary(capsys):
     parser = build_parser()
 
     with pytest.raises(SystemExit) as exc:
@@ -213,9 +214,82 @@ def test_packs_bundle_help_states_safe_publication_boundary(capsys):
 
     assert exc.value.code == 0
     normalized = " ".join(capsys.readouterr().out.split())
-    assert "safe local publication capability" in normalized
-    assert "unsupported platforms fail before writes" in normalized
-    assert "delivery authority" not in normalized
+    assert "public command is retired and unavailable" in normalized
+    assert "internal deterministic, capability-gated seam only" in normalized
+    assert "Write a local bundle projection" not in normalized
+    assert "safe local publication capability" not in normalized
+
+
+@pytest.mark.parametrize(
+    ("authority", "expected"),
+    (
+        ("fresh", "runtime_command_unsupported\n"),
+        ("sqlite", "runtime_command_unsupported\n"),
+        ("legacy", "legacy_workspace_unsupported\n"),
+    ),
+)
+def test_packs_bundle_public_authority_guard_precedes_projection_without_effects(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+    expected: str,
+) -> None:
+    workspace = tmp_path / authority
+    if authority == "sqlite":
+        workspace.mkdir()
+        (workspace / "briefloop.db").write_bytes(b"guard classification only")
+    elif authority == "legacy":
+        control = workspace / "output" / "intermediate" / "runtime_manifest.json"
+        control.parent.mkdir(parents=True)
+        control.write_text("{}\n", encoding="utf-8")
+
+    before = (
+        {
+            path.relative_to(workspace).as_posix(): path.read_bytes()
+            for path in workspace.rglob("*")
+            if path.is_file()
+        }
+        if workspace.exists()
+        else {}
+    )
+
+    def forbidden_projection(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("public guard must reject before bundle projection")
+
+    monkeypatch.setattr(
+        product_commands,
+        "write_report_bundle_manifest",
+        forbidden_projection,
+    )
+
+    assert (
+        main(
+            [
+                "packs",
+                "bundle",
+                "--workspace",
+                str(workspace),
+                "--write-archives",
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().out == expected
+    after = (
+        {
+            path.relative_to(workspace).as_posix(): path.read_bytes()
+            for path in workspace.rglob("*")
+            if path.is_file()
+        }
+        if workspace.exists()
+        else {}
+    )
+    assert after == before
+    assert not (workspace / "output" / "report_bundle_manifest.json").exists()
+    assert not (workspace / "output" / "delivery_bundle.zip").exists()
+    assert not (workspace / "output" / "audit_bundle.zip").exists()
 
 
 def test_cli_init_can_configure_initial_news_backfill(tmp_path):

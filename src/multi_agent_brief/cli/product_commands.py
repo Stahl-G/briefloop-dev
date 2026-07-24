@@ -157,13 +157,10 @@ def register_packs(subparsers: argparse._SubParsersAction) -> None:
 
     bundle_parser = actions.add_parser(
         "bundle",
-        help=(
-            "Write a local bundle projection when safe local publication "
-            "capability is available."
-        ),
+        help="Retired public command; internal deterministic bundle seam only.",
         description=(
-            "Write a local bundle projection when safe local publication "
-            "capability is available."
+            "This public command is retired and unavailable. ReportBundle "
+            "remains an internal deterministic, capability-gated seam only."
         ),
     )
     bundle_parser.add_argument(
@@ -176,10 +173,7 @@ def register_packs(subparsers: argparse._SubParsersAction) -> None:
     bundle_parser.add_argument(
         "--write-archives",
         action="store_true",
-        help=(
-            "Also write clean delivery_bundle.zip and audit_bundle.zip; "
-            "unsupported platforms fail before writes."
-        ),
+        help="Compatibility option for the unavailable public command.",
     )
     bundle_parser.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON."

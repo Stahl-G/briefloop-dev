@@ -391,6 +391,7 @@ def build_report_bundle_manifest(
     workspace: str | Path,
     template_registry: ReportTemplateRegistry | None = None,
 ) -> dict[str, Any]:
+    _require_safe_bundle_read()
     ws = Path(workspace).expanduser().resolve()
     finalize_report = _load_finalize_report(ws)
     hygiene: dict[str, Any] = {"status": "clean", "excluded_artifacts": []}
@@ -451,6 +452,7 @@ def write_report_bundle_manifest(
     template_registry: ReportTemplateRegistry | None = None,
     write_archives: bool = False,
 ) -> dict[str, Any]:
+    _require_safe_bundle_read()
     ws = Path(workspace).expanduser().resolve()
     target = _manifest_output_path(ws, output_path)
     _raise_if_reserved_archive_output(ws, target)
@@ -589,6 +591,7 @@ def _write_bundle_archives(
 ) -> dict[str, Any]:
     """Safely publish both archives for the existing deterministic seam."""
 
+    _require_safe_bundle_read()
     output_dir = workspace / "output"
     parent = _ProjectionParent.open(workspace, output_dir)
     staged: list[_StagedProjection] = []
@@ -733,6 +736,25 @@ def _supports_safe_bundle_publication() -> bool:
         and bool(getattr(os, "O_NOFOLLOW", 0))
         and callable(getattr(os, "fstat", None))
     )
+
+
+def _supports_safe_bundle_read() -> bool:
+    """Return whether retained, no-follow member reads are available."""
+
+    required_dir_fd = (os.open, os.stat)
+    return (
+        all(function in os.supports_dir_fd for function in required_dir_fd)
+        and os.stat in os.supports_follow_symlinks
+        and bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and callable(getattr(os, "fstat", None))
+        and callable(getattr(os, "read", None))
+    )
+
+
+def _require_safe_bundle_read() -> None:
+    if not _supports_safe_bundle_read():
+        raise ReportBundleProjectionError("bundle_projection_read_unsupported")
 
 
 def _validate_projection_leaf(leaf: str) -> None:
@@ -1338,6 +1360,7 @@ def _read_verified_workspace_member(
 ) -> tuple[str, bytes]:
     """Read one classified member through retained no-follow directory handles."""
 
+    _require_safe_bundle_read()
     decision = classify_workspace_member(workspace, candidate, surface=surface)
     if decision.status != "include" or decision.relative_path is None:
         raise ReportBundleProjectionError(
@@ -1347,15 +1370,25 @@ def _read_verified_workspace_member(
         )
     root = workspace.expanduser().resolve(strict=True)
     parts = Path(decision.relative_path).parts
-    directory_fd = os.open(
-        root,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-    )
+    directory_fd = -1
+    chunks: list[bytes] = []
+    before: os.stat_result | None = None
     try:
+        directory_fd = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
         for part in parts[:-1]:
+            observed = os.stat(
+                part,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(observed.st_mode):
+                raise OSError("workspace member parent is not a directory")
             next_fd = os.open(
                 part,
                 os.O_RDONLY
@@ -1364,8 +1397,23 @@ def _read_verified_workspace_member(
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=directory_fd,
             )
+            opened = os.fstat(next_fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (observed.st_dev, observed.st_ino)
+            ):
+                os.close(next_fd)
+                raise OSError("workspace member parent changed")
             os.close(directory_fd)
             directory_fd = next_fd
+        observed = os.stat(
+            parts[-1],
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(observed.st_mode):
+            raise OSError("workspace member is not regular")
         leaf_fd = os.open(
             parts[-1],
             os.O_RDONLY
@@ -1375,9 +1423,12 @@ def _read_verified_workspace_member(
         )
         try:
             before = os.fstat(leaf_fd)
-            if not stat.S_ISREG(before.st_mode):
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or (before.st_dev, before.st_ino)
+                != (observed.st_dev, observed.st_ino)
+            ):
                 raise OSError("workspace member is not regular")
-            chunks: list[bytes] = []
             while True:
                 chunk = os.read(leaf_fd, 1024 * 1024)
                 if not chunk:
@@ -1391,14 +1442,15 @@ def _read_verified_workspace_member(
                 raise OSError("workspace member changed during read")
         finally:
             os.close(leaf_fd)
-    except OSError as exc:
+    except (OSError, NotImplementedError) as exc:
         raise ReportBundleProjectionError(
             f"workspace member is unreadable or changed: {decision.relative_path}"
         ) from exc
     finally:
-        os.close(directory_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
     payload = b"".join(chunks)
-    if len(payload) != before.st_size:
+    if before is None or len(payload) != before.st_size:
         raise ReportBundleProjectionError(
             f"workspace member changed during read: {decision.relative_path}"
         )
