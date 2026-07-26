@@ -307,10 +307,9 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
             workspace_codex_adapter_loader,
         )
         from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
-        from multi_agent_brief.sources.base import SourceItem
+        from multi_agent_brief.sources import base as source_base
         from multi_agent_brief.sources.search_backends.base import SearchBackendError
         from multi_agent_brief.sources.search_backends.tavily import TavilyBackend
-        from multi_agent_brief.sources.web_search import WebSearchProvider
 
         base = Path(sys.argv[1])
         expected_package_root = Path(sys.argv[2]).resolve()
@@ -382,46 +381,56 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
         assert status == 200
         assert response["execution_authorized"] is False
         assert response["source_discovery_authorized"] is True
+        assert response["search_secret_status"] == "ready"
         workspace = base / "workspace"
         calls = 0
 
-        def collect(_provider, _query, _config):
+        class SearchResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return json.dumps(
+                    {
+                        "results": [
+                            {
+                                "title": "Durable result",
+                                "url": "https://example.com/durable",
+                                "content": "discovery snippet",
+                                "raw_content": "durable provider content",
+                                "published_date": "2026-07-26",
+                                "score": 0.9,
+                            },
+                            {
+                                "title": "Snippet result",
+                                "url": "https://example.com/snippet",
+                                "content": "search snippet only",
+                                "raw_content": None,
+                                "published_date": "2026-07-26",
+                                "score": 0.5,
+                            },
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def search_call(request, timeout=30):
             global calls
             calls += 1
-            return [
-                SourceItem(
-                    source_id="durable",
-                    source_name="Example publisher",
-                    source_type="web_search",
-                    title="Durable result",
-                    content="durable provider content",
-                    url="https://example.com/durable",
-                    retrieved_at="2026-07-26T00:00:00Z",
-                    metadata={
-                        "backend": "tavily",
-                        "content_shape": "provider_raw_content",
-                        "has_raw_content": True,
-                        "evidence_quality": "partial_extract",
-                    },
-                ),
-                SourceItem(
-                    source_id="snippet",
-                    source_name="Example publisher",
-                    source_type="web_search",
-                    title="Snippet result",
-                    content="search snippet only",
-                    url="https://example.com/snippet",
-                    retrieved_at="2026-07-26T00:00:00Z",
-                    metadata={
-                        "backend": "tavily",
-                        "content_shape": "search_snippet",
-                        "has_raw_content": False,
-                        "evidence_quality": "snippet",
-                    },
-                ),
-            ]
+            assert timeout == 30
+            assert request.full_url == "https://api.tavily.com/search"
+            assert os.environ["TAVILY_API_KEY"] == "tvly-wheel-secret-sentinel"
+            request_payload = json.loads(request.data.decode("utf-8"))
+            assert request_payload["include_raw_content"] is True
+            assert request_payload["api_key"] == "tvly-wheel-secret-sentinel"
+            return SearchResponse()
 
-        WebSearchProvider.collect = collect
+        os.environ.pop("TAVILY_API_KEY", None)
+        source_base._utc_now_iso = lambda: "2026-07-26T00:00:00Z"
+        urllib.request.urlopen = search_call
         service = RuntimeHostService(
             workspace,
             adapter_loader=workspace_codex_adapter_loader(workspace),
@@ -438,6 +447,7 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
             assert continued.status == "needs_attention"
             assert continued.reason_code == "checkout_publication_unsupported"
             assert calls == 0
+            assert "TAVILY_API_KEY" not in os.environ
             result = {
                 "platform_boundary": continued.reason_code,
                 "provider_calls": calls,
@@ -447,6 +457,7 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
         else:
             assert continued.status == "role_work_required"
             assert calls == 1
+            assert "TAVILY_API_KEY" not in os.environ
             with SQLiteControlStore.open(workspace / "briefloop.db") as store:
                 head = store.load_workspace_run_head()
                 assert head is not None

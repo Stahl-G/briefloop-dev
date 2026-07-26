@@ -15,7 +15,10 @@ import pytest
 
 from multi_agent_brief.cli.init_wizard import create_workspace
 from multi_agent_brief.cli.main import main
-from multi_agent_brief.cli.secrets_commands import SecretImportError
+from multi_agent_brief.cli.secrets_commands import (
+    SecretImportError,
+    store_workspace_secret,
+)
 from multi_agent_brief.control_store import SQLiteControlStore
 from multi_agent_brief.core_run_v2.policy import derived_id
 from multi_agent_brief.core_run_v2.errors import CoreRunResult
@@ -238,6 +241,7 @@ def test_public_web_submission_stores_tavily_key_outside_run_contract(
     assert response["source_discovery_authorized"] is True
     assert response["completion_target"] == "finalized_local"
     assert response["repair_budget"] == 1
+    assert response["search_secret_status"] == "ready"
     assert response["source_discovery"] == {
         "mode": "automatic",
         "profile": "llm_decide",
@@ -250,14 +254,21 @@ def test_public_web_submission_stores_tavily_key_outside_run_contract(
     assert b"tvly-test-secret-123" not in (workspace / "briefloop.db").read_bytes()
 
     revision = _revision(workspace)
+    secret_mtime = secret_path.stat().st_mtime_ns
+    ready_replay = _submit_ok(submitter, body)
+    assert ready_replay["status"] == "replayed"
+    assert ready_replay["search_secret_status"] == "ready"
+    assert secret_path.stat().st_mtime_ns == secret_mtime
+    assert _revision(workspace) == revision
+
     submitter._forget_search_secret("web-session")
     secret_path.unlink()
 
-    replay = _submit_ok(submitter, body)
+    with pytest.raises(SubmissionError) as error:
+        submitter.submit(body)
 
-    assert replay["status"] == "replayed"
-    assert replay["execution_authorized"] is False
-    assert replay["source_discovery_authorized"] is True
+    assert error.value.error_code == "submission_search_api_key_required"
+    assert error.value.http_status == 422
     assert _revision(workspace) == revision
 
 
@@ -298,6 +309,13 @@ def test_public_web_secret_store_failure_preserves_discovery_authority(
 
     assert error.value.error_code == "submission_search_secret_store_failed"
     assert error.value.http_status == 500
+    assert error.value.response_metadata == {
+        "initialization_status": "committed",
+        "search_secret_status": "pending",
+    }
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert "tvly-secret-store-failure" not in repr(error.value)
     workspace = tmp_path / "web-search-ws"
     assert not (workspace / ".env").exists()
     with SQLiteControlStore.open(workspace / "briefloop.db") as store:
@@ -311,13 +329,49 @@ def test_public_web_secret_store_failure_preserves_discovery_authority(
     ).read_bytes()
     revision = snapshot.store_revision
 
+    changed = deepcopy(body)
+    changed_payload = changed["payload"]
+    assert isinstance(changed_payload, dict)
+    changed_selections = changed_payload["selections"]
+    assert isinstance(changed_selections, dict)
+    changed_selections["task_objective"] = "A conflicting objective."
+    with monkeypatch.context() as guarded:
+        guarded.setattr(
+            submitter,
+            "_search_secret",
+            lambda **_kwargs: pytest.fail(
+                "semantic replay must precede pending-secret access"
+            ),
+        )
+        with pytest.raises(SubmissionError) as conflict:
+            submitter.submit(changed)
+    assert conflict.value.error_code == "submission_replay_conflict"
+
+    with pytest.raises(SubmissionError) as repeated:
+        submitter.submit(body)
+
+    assert repeated.value.error_code == "submission_search_secret_store_failed"
+    assert repeated.value.response_metadata == {
+        "initialization_status": "committed",
+        "search_secret_status": "pending",
+    }
+    assert _revision(workspace) == revision
+    assert not (workspace / ".env").exists()
+
+    monkeypatch.setattr(
+        "multi_agent_brief.product.init_web.submit.store_workspace_secret",
+        store_workspace_secret,
+    )
     status, replay = submitter.submit(body)
 
     assert status == 200
     assert replay["status"] == "replayed"
     assert replay["source_discovery_authorized"] is True
+    assert replay["search_secret_status"] == "recovered"
     assert _revision(workspace) == revision
-    assert not (workspace / ".env").exists()
+    assert (workspace / ".env").read_text(encoding="utf-8") == (
+        "TAVILY_API_KEY=tvly-secret-store-failure\n"
+    )
 
 
 def test_public_web_submission_requires_secret_before_workspace_write(

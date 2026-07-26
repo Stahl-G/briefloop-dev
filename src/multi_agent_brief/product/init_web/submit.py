@@ -23,7 +23,10 @@ from multi_agent_brief.cli.secrets_commands import (
     SecretImportError,
     store_workspace_secret,
 )
-from multi_agent_brief.core.env import get_known_env_value
+from multi_agent_brief.core.env import (
+    get_known_env_value,
+    read_workspace_env_key,
+)
 from multi_agent_brief.contracts.v2 import (
     ExecutionSourceManifest,
     RunExecutionAuthorizationBootstrap,
@@ -55,12 +58,19 @@ _REQUIRED_SELECTION_KEYS = ("company", "industry_or_theme", "task_objective")
 
 
 class SubmissionError(ValueError):
-    """Typed submission rejection carrying an HTTP status and zero writes."""
+    """Typed submission rejection with sanitized in-memory response metadata."""
 
-    def __init__(self, error_code: str, http_status: int) -> None:
+    def __init__(
+        self,
+        error_code: str,
+        http_status: int,
+        *,
+        response_metadata: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(error_code)
         self.error_code = error_code
         self.http_status = http_status
+        self.response_metadata = dict(response_metadata or {})
 
 
 def _runtime_submission_error(exc: RuntimeHostError) -> SubmissionError:
@@ -658,13 +668,44 @@ class InitWebSubmitter:
             bootstrap = WorkspaceBootstrap(target)
             authority_kind = bootstrap.classify_target()
             if authority_kind == "sqlite":
+                response = self._replay_existing_store(
+                    target=target,
+                    expected_workspace_id=workspace_id,
+                    expected_run_id=run_id,
+                    request_workspace_prefix=request_workspace_prefix,
+                )
+                if profile.web_search_mode == "external_api":
+                    if read_workspace_env_key(target, "TAVILY_API_KEY"):
+                        self._forget_search_secret(search_secret_session_id)
+                        response["search_secret_status"] = "ready"
+                    else:
+                        search_secret = self._search_secret(
+                            session_id=search_secret_session_id,
+                            target=target,
+                            profile=profile,
+                        )
+                        secret_store_failed = False
+                        try:
+                            store_workspace_secret(
+                                workspace=target,
+                                key="TAVILY_API_KEY",
+                                value=search_secret,
+                            )
+                        except SecretImportError:
+                            secret_store_failed = True
+                        if secret_store_failed:
+                            raise SubmissionError(
+                                "submission_search_secret_store_failed",
+                                500,
+                                response_metadata={
+                                    "initialization_status": "committed",
+                                    "search_secret_status": "pending",
+                                },
+                            ) from None
+                        self._forget_search_secret(search_secret_session_id)
+                        response["search_secret_status"] = "recovered"
                 return 200, self._with_search_discovery(
-                    self._replay_existing_store(
-                        target=target,
-                        expected_workspace_id=workspace_id,
-                        expected_run_id=run_id,
-                        request_workspace_prefix=request_workspace_prefix,
-                    ),
+                    response,
                     profile=profile,
                 )
             if authority_kind == "invalid_sqlite":
@@ -742,26 +783,34 @@ class InitWebSubmitter:
             except RuntimeHostError as exc:
                 raise _runtime_submission_error(exc) from exc
             if search_secret is not None:
+                secret_store_failed = False
                 try:
                     store_workspace_secret(
                         workspace=target,
                         key="TAVILY_API_KEY",
                         value=search_secret,
                     )
-                except SecretImportError as exc:
+                except SecretImportError:
+                    secret_store_failed = True
+                if secret_store_failed:
                     raise SubmissionError(
-                        "submission_search_secret_store_failed", 500
-                    ) from exc
+                        "submission_search_secret_store_failed",
+                        500,
+                        response_metadata={
+                            "initialization_status": "committed",
+                            "search_secret_status": "pending",
+                        },
+                    ) from None
                 self._forget_search_secret(search_secret_session_id)
-            return 200, self._with_search_discovery(
-                self._receipt_response(
-                    target=target,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    status="committed" if initialized.initialized else "replayed",
-                ),
-                profile=profile,
+            response = self._receipt_response(
+                target=target,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                status="committed" if initialized.initialized else "replayed",
             )
+            if profile.web_search_mode == "external_api":
+                response["search_secret_status"] = "ready"
+            return 200, self._with_search_discovery(response, profile=profile)
 
 
 __all__ = [

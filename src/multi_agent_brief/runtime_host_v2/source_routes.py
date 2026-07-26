@@ -88,6 +88,7 @@ def collect_frozen_sources(
                         "enabled": True,
                         "mode": "external_api",
                         "backend": spec.provider_id,
+                        "_workspace_dir": str(workspace),
                         "max_results": request.max_results,
                         "recency_days": request.recency_days,
                         "search_tasks": [

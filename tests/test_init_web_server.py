@@ -54,6 +54,15 @@ class _StubSubmitter:
         self.calls.append(body)
         if self._response_status == "conflict":
             raise SubmissionError("submission_replay_conflict", 409)
+        if self._response_status == "secret_pending":
+            raise SubmissionError(
+                "submission_search_secret_store_failed",
+                500,
+                response_metadata={
+                    "initialization_status": "committed",
+                    "search_secret_status": "pending",
+                },
+            )
         response: dict[str, object] = {
             "ok": True,
             "status": self._response_status,
@@ -173,6 +182,11 @@ def test_get_assets_and_security_headers(server) -> None:
     assert b"finalized_local" in body
     assert b"payload.repair_budget = 1" in body
     assert b'/api/v1/search-secret' in body
+    assert b"submission_search_secret_store_failed" in body
+    assert b'search_secret_status === "pending"' in body
+    assert b'search_secret_status === "recovered"' in body
+    assert b"nothing was written" in body
+    assert b"Workspace initialization committed" in body
     assert (
         b'web_search_mode: c.source === "public_web" ? "external_api" : "disabled"'
         in body
@@ -557,6 +571,37 @@ def test_submission_error_maps_to_status_and_reason(server) -> None:
         assert json.loads(body)["reason_code"] == "submission_replay_conflict"
     finally:
         conflict.close()
+
+
+def test_pending_search_secret_reports_committed_recovery_state() -> None:
+    instance = create_init_web_server(
+        _StubSubmitter(response_status="secret_pending"),
+        exit_on_success=True,
+    )
+    instance.start()
+    try:
+        token, session = _credentials(instance.url)
+        status, _headers, body = _request(
+            instance,
+            "POST",
+            f"/api/v1/submit?session_id={session}",
+            body=_submit_body(),
+            headers={
+                "Content-Type": "application/json",
+                SESSION_TOKEN_HEADER: token,
+            },
+        )
+        assert status == 500
+        assert json.loads(body) == {
+            "ok": False,
+            "reason_code": "submission_search_secret_store_failed",
+            "initialization_status": "committed",
+            "search_secret_status": "pending",
+        }
+        assert instance.outcome is None
+        assert instance._thread is not None and instance._thread.is_alive()
+    finally:
+        instance.close()
 
 
 def test_server_exits_on_success_when_configured() -> None:

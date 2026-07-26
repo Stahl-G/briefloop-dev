@@ -182,6 +182,9 @@ def create_init_web_server(
                 "backend": source_discovery.get("backend"),
                 "api_key_env": source_discovery.get("api_key_env"),
             }
+        search_secret_status = response.get("search_secret_status")
+        if search_secret_status in {"ready", "recovered"}:
+            friendly["search_secret_status"] = search_secret_status
         return friendly
 
     def _shutdown_soon() -> None:
@@ -341,6 +344,7 @@ def create_init_web_server(
                 status, response = exc.http_status, {
                     "ok": False,
                     "reason_code": exc.error_code,
+                    **exc.response_metadata,
                 }
             if (
                 target.path == "/api/v1/submit"

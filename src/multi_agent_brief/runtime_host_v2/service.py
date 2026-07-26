@@ -375,17 +375,6 @@ class RuntimeHostService:
                     reason_code="control_store_integrity_invalid",
                     transaction_ids=tuple(transaction_ids),
                 )
-            if prepromotion and not known_env_key_is_set(
-                discovery_authorizations[0].secret_env_name,
-                self.workspace,
-            ):
-                return build_runtime_continuation_result(
-                    current.verified,
-                    action,
-                    status="needs_attention",
-                    reason_code="source_provider_secret_unavailable",
-                    transaction_ids=tuple(transaction_ids),
-                )
             if action.action_kind == "complete":
                 if (
                     action.effect_kind != "finalized_local"
@@ -2098,20 +2087,55 @@ class RuntimeHostService:
             or action.source_provider_id != discovery.provider_id
         ):
             raise RuntimeHostError("source_discovery_authorization_invalid")
+        active_recovery = (
+            action.reason_code
+            == "active_discovery_source_acquire_requires_resume"
+        )
+        recovery_envelope = None
+        source_action = action
+        if active_recovery:
+            active = [
+                item
+                for item in current.verified.snapshot.invocations
+                if item.status == "active"
+            ]
+            if len(active) != 1:
+                raise RuntimeHostError("control_store_integrity_invalid")
+            recovery_envelope = self._expected_invocation_envelope(
+                active[0].invocation_id,
+                current=current,
+            )
+            source_action = recovery_envelope.action
+            if (
+                source_action.action_kind != "deterministic"
+                or source_action.effect_kind != "source_acquire"
+                or source_action.reason_code
+                != "deterministic_source_route_required"
+                or source_action.stage_id != "source-discovery"
+                or source_action.source_route_id != discovery.source_route_id
+                or source_action.source_provider_id != discovery.provider_id
+                or recovery_envelope.role_id != "source-provider"
+            ):
+                raise RuntimeHostError("control_store_integrity_invalid")
         invocation_request_id = derived_id(
             "REQ-HOST-INVOKE",
-            action.run_id,
-            action.action_fingerprint,
+            source_action.run_id,
+            source_action.action_fingerprint,
         )
         _, invocation_id = self._planned_invocation(
             current,
-            action,
+            source_action,
             request_id=invocation_request_id,
         )
+        if (
+            recovery_envelope is not None
+            and recovery_envelope.invocation_id != invocation_id
+        ):
+            raise RuntimeHostError("control_store_integrity_invalid")
         commit_request_id = derived_id(
             "REQ-HOST-SOURCE-PACK",
-            action.run_id,
-            action.action_fingerprint,
+            source_action.run_id,
+            source_action.action_fingerprint,
         )
         replay = self._source_pack_store_replay(
             current,
@@ -2125,14 +2149,17 @@ class RuntimeHostService:
         stage_identity = canonical_fingerprint(
             {
                 "kind": "discovery_source_pack",
-                "run_id": action.run_id,
-                "action_fingerprint": action.action_fingerprint,
+                "run_id": source_action.run_id,
+                "action_fingerprint": source_action.action_fingerprint,
                 "discovery_authorization_id": discovery.authorization_id,
             }
         )
         stage_fingerprint = canonical_fingerprint(
             {
-                "action": action.model_dump(mode="json", exclude_unset=False),
+                "action": source_action.model_dump(
+                    mode="json",
+                    exclude_unset=False,
+                ),
                 "route_fingerprint": route.route_fingerprint,
                 "discovery_request_fingerprint": discovery.request_fingerprint,
             }
@@ -2148,19 +2175,30 @@ class RuntimeHostService:
             discard_source_stage(self.workspace, stage_identity=stage_identity)
             self._record_staged_invocation_failure(
                 current,
-                action,
+                source_action,
                 request_id=invocation_request_id,
                 invocation_id=invocation_id,
                 reason_code="proposal_invalid",
             )
             raise RuntimeHostError("source_provider_result_invalid") from None
         if stage is None:
+            if active_recovery:
+                self._record_staged_invocation_failure(
+                    current,
+                    source_action,
+                    request_id=invocation_request_id,
+                    invocation_id=invocation_id,
+                    reason_code="proposal_invalid",
+                )
+                raise RuntimeHostError(
+                    "source_provider_result_invalid"
+                ) from None
             if not known_env_key_is_set(discovery.secret_env_name, self.workspace):
                 raise RuntimeHostError("source_provider_secret_unavailable")
             try:
                 materials = collect_frozen_sources(
                     self.workspace,
-                    run_id=action.run_id,
+                    run_id=source_action.run_id,
                     invocation_id=invocation_id,
                     route=route,
                 )
@@ -2208,7 +2246,7 @@ class RuntimeHostService:
             except SearchBackendError:
                 self._record_staged_invocation_failure(
                     current,
-                    action,
+                    source_action,
                     request_id=invocation_request_id,
                     invocation_id=invocation_id,
                     reason_code="child_failed",
@@ -2222,7 +2260,7 @@ class RuntimeHostService:
                 )
                 self._record_staged_invocation_failure(
                     current,
-                    action,
+                    source_action,
                     request_id=invocation_request_id,
                     invocation_id=invocation_id,
                     reason_code="proposal_invalid",
@@ -2237,7 +2275,7 @@ class RuntimeHostService:
             ):
                 self._record_staged_invocation_failure(
                     current,
-                    action,
+                    source_action,
                     request_id=invocation_request_id,
                     invocation_id=invocation_id,
                     reason_code="proposal_invalid",
@@ -2254,18 +2292,30 @@ class RuntimeHostService:
             discard_source_stage(self.workspace, stage_identity=stage_identity)
             self._record_staged_invocation_failure(
                 current,
-                action,
+                source_action,
                 request_id=invocation_request_id,
                 invocation_id=invocation_id,
                 reason_code="proposal_invalid",
             )
             raise RuntimeHostError("source_provider_result_invalid") from None
 
-        dispatch = self._start_invocation_for_action(
-            current,
-            action,
-            role_id="source-provider",
-            request_id=invocation_request_id,
+        dispatch = (
+            InvocationDispatch(
+                envelope=recovery_envelope,
+                envelope_path=(
+                    self.workspace
+                    / "scratch"
+                    / invocation_id
+                    / "task_envelope.json"
+                ),
+            )
+            if recovery_envelope is not None
+            else self._start_invocation_for_action(
+                current,
+                source_action,
+                role_id="source-provider",
+                request_id=invocation_request_id,
+            )
         )
         if dispatch.envelope.invocation_id != invocation_id:
             raise RuntimeHostError("control_store_integrity_invalid")
@@ -2274,7 +2324,7 @@ class RuntimeHostService:
         )
         intake_input = _CoreDiscoverySourcePack(
             request_id=commit_request_id,
-            run_id=action.run_id,
+            run_id=source_action.run_id,
             invocation_id=invocation_id,
             expected_store_revision=dispatch.envelope.store_revision,
             manifest=manifest,

@@ -7,6 +7,7 @@ from dataclasses import replace
 import hashlib
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -319,6 +320,7 @@ def test_discovery_missing_runtime_secret_is_zero_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = _discovery_workspace(tmp_path)
+    _advance_discovery_to_source_action(workspace)
     (workspace / ".env").unlink()
     revision = _revision(workspace)
     calls = 0
@@ -365,6 +367,9 @@ def test_discovery_authority_rejects_public_source_files_before_sibling_reads(
             request_id=f"REQ-PUBLIC-GUARD-{entrypoint.upper()}",
         )
         invocation_id = dispatch.envelope.invocation_id
+        reserved = host.next_action()
+        assert reserved.effect_kind == "invocation_accept_or_fail"
+        assert reserved.reason_code == "active_invocation_reserved"
     else:
         invocation_id = f"INV-PUBLIC-GUARD-{entrypoint.upper()}"
     request_path = _public_source_request(
@@ -674,6 +679,73 @@ def test_discovery_continue_promotes_one_mixed_pack_atomically(
     assert _revision(workspace) == revision
 
 
+def test_discovery_workspace_env_reaches_real_tavily_boundary_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    calls: list[dict[str, object]] = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read() -> bytes:
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Durable source",
+                            "url": "https://example.com/durable",
+                            "content": "snippet only",
+                            "raw_content": "durable provider content",
+                            "published_date": "2026-07-26",
+                            "score": 0.9,
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def urlopen(request, *, timeout):
+        assert timeout == 30
+        assert request.full_url == "https://api.tavily.com/search"
+        assert os.environ["TAVILY_API_KEY"] == "tvly-runtime-secret-sentinel"
+        payload = json.loads(request.data.decode("utf-8"))
+        calls.append(payload)
+        return _Response()
+
+    monkeypatch.setattr(
+        "multi_agent_brief.sources.search_backends.tavily.urllib.request.urlopen",
+        urlopen,
+    )
+    action = _advance_discovery_to_source_action(workspace)
+
+    result = _service(workspace).apply_current(action)
+
+    assert result.status == "committed"
+    assert len(calls) == 1
+    assert calls[0]["include_raw_content"] is True
+    assert calls[0]["api_key"] == "tvly-runtime-secret-sentinel"
+    assert "TAVILY_API_KEY" not in os.environ
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot = store.load_snapshot(head.current_run_id)
+    assert len(snapshot.sources) == 1
+    assert snapshot.sources[0].origin_type == "provider_response"
+    assert snapshot.sources[0].acquisition_method == "provider_extract"
+    assert snapshot.sources[0].material_kind == "partial_extract"
+    assert snapshot.sources[0].claims_eligible is True
+    assert len(snapshot.run_execution_authorizations) == 1
+    database = (workspace / "briefloop.db").read_bytes()
+    assert b"tvly-runtime-secret-sentinel" not in database
+
+
 def test_discovery_exact_receipt_replay_precedes_secret_and_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -741,6 +813,115 @@ def test_discovery_precommit_crash_reuses_staged_bytes_before_secret_or_provider
         snapshot = store.load_snapshot(head.current_run_id)
     assert len(snapshot.sources) == 1
     assert len(snapshot.run_execution_authorizations) == 1
+
+
+def test_discovery_active_invocation_reuses_receipt_owned_stage_without_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    provider_calls = 0
+
+    def collect(_provider, _query, _config):
+        nonlocal provider_calls
+        provider_calls += 1
+        return [_tavily_item(durable=True)]
+
+    def crash_before_promotion(_instance, _input):
+        raise RuntimeHostError("simulated_post_invocation_crash")
+
+    monkeypatch.setattr(WebSearchProvider, "collect", collect)
+    monkeypatch.setattr(
+        IntakeService,
+        "_commit_discovery_source_pack_from_core",
+        crash_before_promotion,
+    )
+    action = _advance_discovery_to_source_action(workspace)
+
+    with pytest.raises(RuntimeHostError, match="simulated_post_invocation_crash"):
+        _service(workspace).apply_current(action)
+
+    resumed = _service(workspace).next_action()
+    assert resumed.action_kind == "deterministic"
+    assert resumed.effect_kind == "source_acquire"
+    assert (
+        resumed.reason_code
+        == "active_discovery_source_acquire_requires_resume"
+    )
+    (workspace / ".env").unlink()
+    monkeypatch.undo()
+
+    committed = _service(workspace).apply_current(resumed)
+
+    assert committed.status == "committed"
+    assert provider_calls == 1
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot = store.load_snapshot(head.current_run_id)
+    assert len(snapshot.sources) == 1
+    assert len(snapshot.run_execution_authorizations) == 1
+
+
+@pytest.mark.parametrize("stage_damage", ["missing", "tampered"])
+def test_discovery_active_invocation_invalid_stage_fails_without_provider_recall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage_damage: str,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    provider_calls = 0
+
+    def collect(_provider, _query, _config):
+        nonlocal provider_calls
+        provider_calls += 1
+        return [_tavily_item(durable=True)]
+
+    def crash_before_promotion(_instance, _input):
+        raise RuntimeHostError("simulated_post_invocation_crash")
+
+    monkeypatch.setattr(WebSearchProvider, "collect", collect)
+    monkeypatch.setattr(
+        IntakeService,
+        "_commit_discovery_source_pack_from_core",
+        crash_before_promotion,
+    )
+    action = _advance_discovery_to_source_action(workspace)
+    stage_identity = _discovery_stage_identity(workspace, action)
+
+    with pytest.raises(RuntimeHostError, match="simulated_post_invocation_crash"):
+        _service(workspace).apply_current(action)
+
+    stage_root = source_stage_root(workspace, stage_identity)
+    if stage_damage == "missing":
+        stage_root.rename(stage_root.with_name(f"{stage_root.name}.missing"))
+    else:
+        next(stage_root.glob("sources/*/source_content.bin")).write_bytes(
+            b"tampered staged content"
+        )
+    (workspace / ".env").unlink()
+    monkeypatch.setattr(
+        WebSearchProvider,
+        "collect",
+        lambda *_args, **_kwargs: pytest.fail("provider must not be recalled"),
+    )
+
+    with pytest.raises(RuntimeHostError, match="source_provider_result_invalid"):
+        _service(workspace).apply_current(_service(workspace).next_action())
+
+    assert provider_calls == 1
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot = store.load_snapshot(head.current_run_id)
+    assert snapshot.sources == ()
+    assert snapshot.run_execution_authorizations == ()
+    failed = [
+        item
+        for item in snapshot.invocations
+        if item.role_id == "source-provider" and item.status == "failed"
+    ]
+    assert len(failed) == 1
 
 
 def test_discovery_tampered_precommit_stage_fails_closed_without_provider_recall(

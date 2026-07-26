@@ -36,7 +36,12 @@ page describes implemented runtime capability, not a breaking deep rename.
   execution manifest, input classification, and execution authorization in
   one receipt only when at least one co-committed source is claims-eligible.
   Snippet-only results remain discovery material and cannot authorize
-  execution.
+  execution. This acquisition-to-`finalized_local` path is demonstrated on
+  retained-publication-capable POSIX/macOS hosts. On Windows, continuation
+  stops before any Tavily call with retry-stable
+  `checkout_publication_unsupported`; no source promotion, execution
+  authorization, finalization, approval, package, delivery, or external effect
+  is claimed there.
 - `role_topology=single_session` uses one shared Codex session with distinct
   Receipt-backed role invocations and stage-separated self-review. It is not an
   independent-review claim.
