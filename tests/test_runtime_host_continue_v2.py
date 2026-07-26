@@ -225,6 +225,325 @@ def _discovery_stage_identity(
     )
 
 
+def _transferred_discovery_source_action(workspace: Path) -> CoreRunNextAction:
+    """Build one verified source-acquire Store fixture without publication."""
+
+    from datetime import datetime, timezone
+
+    from multi_agent_brief.contracts.v2 import (
+        ArtifactRecord,
+        ArtifactRevision,
+        CoreRunEventBinding,
+        OwnedArtifactSubmissionRecord,
+        OwnedArtifactSubmitRequest,
+        PublicationIdentityV1,
+        ReceiptCheckoutBinding,
+    )
+    from multi_agent_brief.control_store.serialization import (
+        canonical_json_bytes,
+        sha256_hex,
+    )
+    from multi_agent_brief.core_run_v2 import artifacts as artifact_service
+    from multi_agent_brief.core_run_v2 import checkout as checkout_service
+    from multi_agent_brief.core_run_v2.policy import (
+        derived_id,
+        transaction_type_for,
+    )
+    from multi_agent_brief.core_run_v2.publication_platform import (
+        CapabilityProfile,
+    )
+    from multi_agent_brief.runtime_host_v2 import service as host_service
+    from multi_agent_brief.runtime_host_v2.scratch import read_role_outputs
+    from multi_agent_brief.runtime_host_v2.source_routes import (
+        _material_from_item,
+    )
+    from multi_agent_brief.runtime_host_v2.submission import (
+        SourceStageBytesInput,
+        stage_source_pack_bytes,
+    )
+
+    service = _service(workspace)
+    planner = service.continue_authorized()
+    assert planner.status == "role_work_required"
+    assert planner.trace.envelope_path is not None
+    proposal_path = (
+        workspace / planner.trace.envelope_path
+    ).parent / "source_candidates.yaml"
+    proposal_path.write_text(
+        "version: 1\ncandidates:\n  - route: web-search\n",
+        encoding="utf-8",
+    )
+    current = initialize_or_open_runtime(
+        workspace,
+        adapter_loader=workspace_codex_adapter_loader(workspace),
+    )
+    active = [
+        item for item in current.verified.snapshot.invocations
+        if item.status == "active"
+    ]
+    assert len(active) == 1
+    envelope = service._expected_invocation_envelope(
+        active[0].invocation_id,
+        current=current,
+    )
+    spec = host_service._ROLE_OUTPUTS["source-planner"]
+    outputs = read_role_outputs(workspace, envelope)
+    request, lane = service._derive_acceptance_request(envelope, spec, outputs)
+    assert isinstance(request, OwnedArtifactSubmitRequest)
+    assert lane is None
+    content = outputs["source_candidates.yaml"]
+    snapshot = current.verified.snapshot
+    artifact = next(
+        item for item in snapshot.artifacts
+        if item.artifact_id == "source_candidates"
+    )
+    assert artifact.current_revision == 0
+    now_value = datetime.now(timezone.utc)
+    now = now_value.isoformat().replace("+00:00", "Z")
+    digest = sha256_hex(content)
+    fingerprint = canonical_fingerprint(
+        request.model_dump(mode="json", exclude_unset=False)
+    )
+    event_id = derived_id("EVT-ARTIFACT", request.request_id, fingerprint)
+    submission_id = derived_id("SUBMISSION", request.request_id, digest)
+    updated = ArtifactRecord.model_validate(
+        {
+            **artifact.model_dump(mode="json", exclude_unset=False),
+            "current_revision": 1,
+            "status": "valid",
+        },
+        strict=True,
+    )
+    revision = ArtifactRevision.model_validate(
+        {
+            "schema_version": ArtifactRevision.schema_id,
+            "run_id": request.run_id,
+            "artifact_id": artifact.artifact_id,
+            "revision": 1,
+            "path": artifact.path,
+            "sha256": digest,
+            "size_bytes": len(content),
+            "frozen": True,
+            "producer_kind": "workflow_stage",
+            "producer_id": "source-planner",
+            "created_at": now,
+        },
+        strict=True,
+    )
+    submission = OwnedArtifactSubmissionRecord.model_validate(
+        {
+            "schema_version": OwnedArtifactSubmissionRecord.schema_id,
+            "submission_id": submission_id,
+            "run_id": request.run_id,
+            "artifact_id": artifact.artifact_id,
+            "artifact_revision": 1,
+            "artifact_sha256": digest,
+            "owner_stage_id": "source-discovery",
+            "owner_role_id": "source-planner",
+            "run_contract_fingerprint": (
+                current.verified.binding.contract_fingerprint
+            ),
+            "invocation_id": request.invocation_id,
+            "producer_tool_id": request.producer_tool_id,
+            "parent_artifact": None,
+            "canonical_workspace_path": artifact.path,
+            "request_fingerprint": fingerprint,
+            "accepted_event_id": event_id,
+            "accepted_transaction_id": request.request_id,
+            "created_at": now,
+        },
+        strict=True,
+    )
+    completed_invocation = artifact_service._completed_invocation(
+        active[0],
+        now,
+    )
+    event = artifact_service._event(
+        event_id=event_id,
+        run_id=request.run_id,
+        transaction_id=request.request_id,
+        event_type="owned_artifact_accepted",
+        stage_id="source-discovery",
+        artifact_id=artifact.artifact_id,
+        reason="owned artifact accepted",
+        created_at=now,
+        binding=CoreRunEventBinding(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            effect_kind="owned_artifact_acceptance",
+            primary_record_id=submission_id,
+            outcome="committed",
+        ),
+    )
+    pre = checkout_service._current_checkout(snapshot)
+    revisions = {
+        (item.artifact_id, item.revision): item
+        for item in snapshot.artifact_revisions
+    }
+    store_resident = checkout_service.store_resident_revision_keys(snapshot)
+    selected = [
+        revisions[(item.artifact_id, item.current_revision)]
+        for item in snapshot.artifacts
+        if item.current_revision > 0
+        and (
+            item.artifact_id,
+            item.current_revision,
+        )
+        not in store_resident
+        and not revisions[
+            (item.artifact_id, item.current_revision)
+        ].path.startswith("briefloop.db.blobs/")
+    ]
+    post = checkout_service.build_checkout_revision(
+        workspace_id=snapshot.workspace_id,
+        run_id=request.run_id,
+        transaction_id=request.request_id,
+        created_at=now_value,
+        artifact_revisions=(*selected, revision),
+        parent_checkout_revision_id=(
+            None if pre is None else pre.record.checkout_revision_id
+        ),
+    )
+    binding = ReceiptCheckoutBinding.model_validate(
+        {
+            "schema_version": ReceiptCheckoutBinding.schema_id,
+            "workspace_id": snapshot.workspace_id,
+            "run_id": request.run_id,
+            "transaction_id": request.request_id,
+            "pre_run_id": request.run_id,
+            "pre_checkout_revision_id": (
+                None if pre is None else pre.record.checkout_revision_id
+            ),
+            "post_run_id": request.run_id,
+            "post_checkout_revision_id": post.record.checkout_revision_id,
+        },
+        strict=True,
+    )
+    identity = PublicationIdentityV1.model_validate(
+        {
+            "schema_version": "briefloop-publication-identity/v1",
+            "workspace_id": snapshot.workspace_id,
+            "run_id": request.run_id,
+            "transaction_id": request.request_id,
+            "checkout_revision_id": post.record.checkout_revision_id,
+        },
+        strict=True,
+    )
+    transferred_profile = CapabilityProfile(
+        platform="darwin",
+        filesystem="apfs",
+        namespace_primitive="renameatx_np(RENAME_EXCL)",
+        temp_durability="F_FULLFSYNC",
+        canonical_post_durability="F_FULLFSYNC",
+        parent_durability="fsync",
+        canonical_open_flags="O_RDWR|O_NOFOLLOW|O_CLOEXEC",
+    )
+    intent, members = checkout_service.build_publication_intent(
+        identity=identity,
+        pre=pre,
+        post=post,
+        capability_profile_sha256=transferred_profile.sha256,
+    )
+    prepared = checkout_service.PreparedCheckoutEffect(
+        pre=pre,
+        post=post,
+        binding=binding,
+        identity=identity,
+        intent=intent,
+        publication_members=members,
+    )
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        unit = store.begin(
+            request.run_id,
+            request.request_id,
+            transaction_type_for("owned_artifact_acceptance"),
+            request.expected_store_revision,
+        )
+        unit.put_invocation(completed_invocation)
+        unit.put_artifact(updated)
+        unit.put_artifact_revision(revision, content)
+        unit.put_owned_artifact_submission(submission)
+        unit.append_event(event)
+        checkout_service.stage_checkout_effect(unit, prepared)
+        unit.commit(
+            _postcommit_observer=lambda _receipt: (
+                CoreRunDomainVerifier().verify(store, request.run_id)
+            )
+        )
+        verified = CoreRunDomainVerifier().verify(store, request.run_id)
+    assert not (workspace / "source_candidates.yaml").exists()
+    action = service.next_action()
+    assert action.effect_kind == "source_acquire"
+    assert verified.snapshot.run_execution_authorizations == ()
+    assert verified.snapshot.sources == ()
+    assert len(verified.snapshot.run_source_discovery_authorizations) == 1
+    discovery = verified.snapshot.run_source_discovery_authorizations[0]
+    route = next(
+        item for item in verified.source_plan.routes
+        if item.route_id == action.source_route_id
+    )
+    invocation_request_id = derived_id(
+        "REQ-HOST-INVOKE",
+        action.run_id,
+        action.action_fingerprint,
+    )
+    current = initialize_or_open_runtime(
+        workspace,
+        adapter_loader=workspace_codex_adapter_loader(workspace),
+    )
+    _, invocation_id = service._planned_invocation(
+        current,
+        action,
+        request_id=invocation_request_id,
+    )
+    material = _material_from_item(
+        workspace=workspace,
+        run_id=action.run_id,
+        invocation_id=invocation_id,
+        route=route,
+        item=_tavily_item(durable=True),
+    )
+    _manifest, proposals, ordered_materials = (
+        service._freeze_discovery_source_manifest((material,))
+    )
+    stage_identity = canonical_fingerprint(
+        {
+            "kind": "discovery_source_pack",
+            "run_id": action.run_id,
+            "action_fingerprint": action.action_fingerprint,
+            "discovery_authorization_id": discovery.authorization_id,
+        }
+    )
+    stage_fingerprint = canonical_fingerprint(
+        {
+            "action": action.model_dump(mode="json", exclude_unset=False),
+            "route_fingerprint": route.route_fingerprint,
+            "discovery_request_fingerprint": discovery.request_fingerprint,
+        }
+    )
+    stage_source_pack_bytes(
+        workspace,
+        stage_identity=stage_identity,
+        request_fingerprint=stage_fingerprint,
+        members=tuple(
+            SourceStageBytesInput(
+                member_id=proposal.source_id,
+                proposal_bytes=canonical_json_bytes(
+                    proposal.model_dump(mode="json", exclude_unset=False)
+                ),
+                content_bytes=source.content,
+                raw_payload_bytes=source.raw_payload,
+            )
+            for proposal, source in zip(
+                proposals,
+                ordered_materials,
+                strict=True,
+            )
+        ),
+    )
+    return action
+
+
 def _tavily_item(*, durable: bool) -> SourceItem:
     return SourceItem(
         source_id="durable" if durable else "snippet",
@@ -890,35 +1209,17 @@ def test_discovery_precommit_crash_reuses_staged_bytes_before_secret_or_provider
     assert len(snapshot.run_execution_authorizations) == 1
 
 
-@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workspace = _discovery_workspace(tmp_path)
-    provider_calls = 0
-
-    def collect(_provider, _query, _config):
-        nonlocal provider_calls
-        provider_calls += 1
-        return [_tavily_item(durable=True)]
-
-    monkeypatch.setattr(WebSearchProvider, "collect", collect)
-    action = _advance_discovery_to_source_action(workspace)
-    stage_identity = _discovery_stage_identity(workspace, action)
-    interrupted = _service(workspace)
-
-    def crash_after_stage(*_args, **_kwargs):
-        raise RuntimeHostError("simulated_precommit_crash")
-
-    monkeypatch.setattr(
-        interrupted,
-        "_start_invocation_for_action",
-        crash_after_stage,
+    from multi_agent_brief.core_run_v2.publication_platform import (
+        capability_profile as actual_capability_profile,
     )
-    with pytest.raises(RuntimeHostError, match="simulated_precommit_crash"):
-        interrupted.apply_current(action)
-    assert provider_calls == 1
+
+    workspace = _discovery_workspace(tmp_path)
+    action = _transferred_discovery_source_action(workspace)
+    stage_identity = _discovery_stage_identity(workspace, action)
 
     stage_root = source_stage_root(workspace, stage_identity)
     stage_before = {
@@ -930,6 +1231,8 @@ def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
         head = store.load_workspace_run_head()
         assert head is not None
         snapshot_before = store.load_snapshot(head.current_run_id)
+    env_before = (workspace / ".env").read_bytes()
+    env_mtime_before = (workspace / ".env").stat().st_mtime_ns
 
     capability_checks = 0
 
@@ -937,6 +1240,11 @@ def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
         nonlocal capability_checks
         capability_checks += 1
         assert path == workspace
+        try:
+            actual_capability_profile(path)
+        except CoreRunError as exc:
+            assert exc.code == "checkout_publication_unsupported"
+            raise
         raise CoreRunError("checkout_publication_unsupported")
 
     def forbidden_credential_read(*_args, **_kwargs):
@@ -970,6 +1278,8 @@ def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
 
     assert capability_checks == 2
     assert "TAVILY_API_KEY" not in os.environ
+    assert (workspace / ".env").read_bytes() == env_before
+    assert (workspace / ".env").stat().st_mtime_ns == env_mtime_before
     assert {
         path.relative_to(stage_root).as_posix(): path.read_bytes()
         for path in stage_root.rglob("*")
