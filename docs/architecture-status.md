@@ -29,6 +29,20 @@ page describes implemented runtime capability, not a breaking deep rename.
 - The workspace-local Codex kit is execution input, not decoration: `run` and
   runtime commands verify its exact config, Skill, reference, and role-file
   inventory against the Store-bound adapter identity.
+- Init-web public-web runs may freeze a non-secret Tavily discovery
+  authorization before source bytes exist. `runtime continue` re-verifies that
+  exact Store authority before secret or provider access, retains durable raw
+  page content separately from search snippets, and promotes sources,
+  execution manifest, input classification, and execution authorization in
+  one receipt only when at least one co-committed source is claims-eligible.
+  Snippet-only results remain discovery material and cannot authorize
+  execution. This acquisition-to-`finalized_local` path is demonstrated on
+  retained-publication-capable POSIX/macOS hosts. On Windows, continuation
+  stops before any Tavily call with retry-stable
+  `checkout_publication_unsupported`. Local initialization, discovery
+  authorization, and the workspace `.env` credential may already be committed,
+  but no provider/network call and no source promotion, execution authorization,
+  finalization, approval, package, delivery, or external publication follows.
 - `role_topology=single_session` uses one shared Codex session with distinct
   Receipt-backed role invocations and stage-separated self-review. It is not an
   independent-review claim.

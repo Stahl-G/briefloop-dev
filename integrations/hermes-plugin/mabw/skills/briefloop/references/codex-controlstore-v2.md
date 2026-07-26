@@ -35,20 +35,25 @@ continues using the protocol it already loaded.
 
 ### Authorized local continuation
 
-When the Store contains the M2 `RunExecutionAuthorization` for
-`completion_target=finalized_local`, use:
+When the Store contains either the M2 `RunExecutionAuthorization` for
+`completion_target=finalized_local` or the narrow Tavily
+`RunSourceDiscoveryAuthorization`, use:
 
 ```bash
 briefloop runtime continue --workspace <workspace>
 ```
 
-The command re-verifies Store and a fresh action before every effect. It may
-commit the parameter-free authorized source pack and other existing
-deterministic effects. `role_work_required` names the exact envelope whose
+The command re-verifies Store and a fresh action before every effect. Before
+execution authorization exists, it may run only the doctor, source planner,
+and exact Store-bound Tavily route. Search snippets remain ineligible; only
+durable provider content can enter the one-receipt source, manifest,
+classification, and execution-authorization promotion. It may also commit the
+parameter-free authorized source pack and other existing deterministic
+effects. `role_work_required` names the exact envelope whose
 scratch proposal the current session must produce; call the command again
 after proposal validation. `proposal_invalid`, `needs_human`, and
 `needs_attention` are stop/attention results. `finalized_local` is terminal and
-never implies approval, packaging, delivery, or repair. Runs without the
+never implies approval, packaging, delivery, or repair. Runs without either
 authorization retain the granular protocol below and receive a zero-write
 unsupported/manual result from `runtime continue`.
 

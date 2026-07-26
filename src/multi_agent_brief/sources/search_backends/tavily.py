@@ -74,7 +74,7 @@ class TavilyBackend(SearchBackend):
             "topic": topic,
             "search_depth": search_depth,
             "include_answer": False,
-            "include_raw_content": False,
+            "include_raw_content": True,
         }
         if days:
             payload["days"] = days
@@ -89,24 +89,34 @@ class TavilyBackend(SearchBackend):
             method="POST",
         )
 
+        transport_failed = False
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
+        except Exception:
+            transport_failed = True
+        if transport_failed:
             raise SearchBackendError(
-                f"Tavily search failed: {type(exc).__name__}: {exc}",
+                "Tavily search failed",
                 backend="tavily",
-            ) from exc
+            ) from None
 
         results: list[SearchResult] = []
         for item in data.get("results", []):
             raw_published = (item.get("published_date") or "").strip()
             has_published = bool(raw_published)
+            raw_content_value = item.get("raw_content")
+            raw_content = (
+                raw_content_value.strip()
+                if isinstance(raw_content_value, str) and raw_content_value.strip()
+                else None
+            )
             results.append(
                 SearchResult(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     snippet=item.get("content", ""),
+                    raw_content=raw_content,
                     published_at=raw_published,
                     source_name=_extract_domain(item.get("url", "")),
                     metadata={
@@ -114,10 +124,12 @@ class TavilyBackend(SearchBackend):
                         "query": query,
                         "date_status": "published_at_present" if has_published else "missing_published_at",
                         "source_temporality": "published" if has_published else "retrieved_only",
-                        "evidence_quality": "snippet",
+                        "evidence_quality": (
+                            "partial_extract" if raw_content is not None else "snippet"
+                        ),
                         "vertical": topic,
                         "raw_score": item.get("score"),
-                        "has_raw_content": bool(item.get("raw_content")),
+                        "has_raw_content": raw_content is not None,
                     },
                 )
             )

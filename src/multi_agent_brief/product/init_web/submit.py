@@ -23,10 +23,14 @@ from multi_agent_brief.cli.secrets_commands import (
     SecretImportError,
     store_workspace_secret,
 )
-from multi_agent_brief.core.env import get_known_env_value
+from multi_agent_brief.core.env import (
+    get_known_env_value,
+    read_workspace_env_key,
+)
 from multi_agent_brief.contracts.v2 import (
     ExecutionSourceManifest,
     RunExecutionAuthorizationBootstrap,
+    RunSourceDiscoveryAuthorizationBootstrap,
 )
 from multi_agent_brief.control_store import SQLiteControlStore
 from multi_agent_brief.control_store.serialization import (
@@ -54,12 +58,19 @@ _REQUIRED_SELECTION_KEYS = ("company", "industry_or_theme", "task_objective")
 
 
 class SubmissionError(ValueError):
-    """Typed submission rejection carrying an HTTP status and zero writes."""
+    """Typed submission rejection with sanitized in-memory response metadata."""
 
-    def __init__(self, error_code: str, http_status: int) -> None:
+    def __init__(
+        self,
+        error_code: str,
+        http_status: int,
+        *,
+        response_metadata: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(error_code)
         self.error_code = error_code
         self.http_status = http_status
+        self.response_metadata = dict(response_metadata or {})
 
 
 def _runtime_submission_error(exc: RuntimeHostError) -> SubmissionError:
@@ -428,9 +439,17 @@ class InitWebSubmitter:
             expected_adapter_loader=self._adapter_loader
         )
         authorizations = initialized.verified.snapshot.run_execution_authorizations
+        discovery_authorizations = (
+            initialized.verified.snapshot.run_source_discovery_authorizations
+        )
         if len(authorizations) > 1:
             raise SubmissionError("control_store_integrity_invalid", 500)
+        if len(discovery_authorizations) > 1:
+            raise SubmissionError("control_store_integrity_invalid", 500)
         authorization = authorizations[0] if authorizations else None
+        discovery_authorization = (
+            discovery_authorizations[0] if discovery_authorizations else None
+        )
         return {
             "ok": True,
             "status": status,
@@ -451,11 +470,24 @@ class InitWebSubmitter:
             },
             "next_command": f"briefloop runtime continue --workspace {target}",
             "execution_authorized": authorization is not None,
+            "source_discovery_authorized": discovery_authorization is not None,
             "completion_target": (
-                authorization.completion_target if authorization is not None else None
+                authorization.completion_target
+                if authorization is not None
+                else (
+                    discovery_authorization.completion_target
+                    if discovery_authorization is not None
+                    else None
+                )
             ),
             "repair_budget": (
-                authorization.repair_budget if authorization is not None else None
+                authorization.repair_budget
+                if authorization is not None
+                else (
+                    discovery_authorization.repair_budget
+                    if discovery_authorization is not None
+                    else None
+                )
             ),
         }
 
@@ -465,7 +497,12 @@ class InitWebSubmitter:
         request_id: str,
         profile: InitProfile,
         payload: dict[str, Any],
-    ) -> tuple[str, ExecutionSourceManifest | None, RunExecutionAuthorizationBootstrap | None]:
+    ) -> tuple[
+        str,
+        ExecutionSourceManifest | None,
+        RunExecutionAuthorizationBootstrap | None,
+        RunSourceDiscoveryAuthorizationBootstrap | None,
+    ]:
         raw_manifest = payload.get("source_manifest")
         if raw_manifest is None:
             if any(
@@ -479,6 +516,26 @@ class InitWebSubmitter:
                 )
             ):
                 raise SubmissionError("submission_source_manifest_required", 422)
+            discovery_authorization = None
+            if (
+                profile.web_search_mode == "external_api"
+                and profile.search_backend == "tavily"
+            ):
+                discovery_authorization = (
+                    RunSourceDiscoveryAuthorizationBootstrap.model_validate(
+                        {
+                            "schema_version": (
+                                RunSourceDiscoveryAuthorizationBootstrap.schema_id
+                            ),
+                            "provider_id": "tavily",
+                            "execution_owner": "deterministic",
+                            "secret_env_name": "TAVILY_API_KEY",
+                            "completion_target": "finalized_local",
+                            "repair_budget": 1,
+                        },
+                        strict=True,
+                    )
+                )
             semantic = {
                 "schema_version": SUBMISSION_SCHEMA,
                 "request_id_namespace": canonical_fingerprint(
@@ -486,8 +543,20 @@ class InitWebSubmitter:
                 ),
                 "selections": asdict(profile),
                 "execution_authorization": None,
+                "source_discovery_authorization": (
+                    None
+                    if discovery_authorization is None
+                    else discovery_authorization.model_dump(
+                        mode="json", exclude_unset=False
+                    )
+                ),
             }
-            return canonical_fingerprint(semantic), None, None
+            return (
+                canonical_fingerprint(semantic),
+                None,
+                None,
+                discovery_authorization,
+            )
         try:
             manifest = ExecutionSourceManifest.model_validate(raw_manifest, strict=True)
         except ValidationError as exc:
@@ -529,7 +598,7 @@ class InitWebSubmitter:
                 mode="json", exclude_unset=False
             ),
         }
-        return canonical_fingerprint(semantic), manifest, authorization
+        return canonical_fingerprint(semantic), manifest, authorization, None
 
     def _replay_existing_store(
         self,
@@ -582,12 +651,12 @@ class InitWebSubmitter:
                 payload.get("search_secret_session_id"),
                 "submission_search_secret_invalid",
             )
-            search_secret = self._search_secret(
-                session_id=search_secret_session_id,
-                target=target,
-                profile=profile,
-            )
-        fingerprint, manifest, execution_authorization = self._semantic_submission(
+        (
+            fingerprint,
+            manifest,
+            execution_authorization,
+            source_discovery_authorization,
+        ) = self._semantic_submission(
             request_id=request_id,
             profile=profile,
             payload=payload,
@@ -599,19 +668,57 @@ class InitWebSubmitter:
             bootstrap = WorkspaceBootstrap(target)
             authority_kind = bootstrap.classify_target()
             if authority_kind == "sqlite":
+                response = self._replay_existing_store(
+                    target=target,
+                    expected_workspace_id=workspace_id,
+                    expected_run_id=run_id,
+                    request_workspace_prefix=request_workspace_prefix,
+                )
+                if profile.web_search_mode == "external_api":
+                    if read_workspace_env_key(target, "TAVILY_API_KEY"):
+                        self._forget_search_secret(search_secret_session_id)
+                        response["search_secret_status"] = "ready"
+                    else:
+                        search_secret = self._search_secret(
+                            session_id=search_secret_session_id,
+                            target=target,
+                            profile=profile,
+                        )
+                        secret_store_failed = False
+                        try:
+                            store_workspace_secret(
+                                workspace=target,
+                                key="TAVILY_API_KEY",
+                                value=search_secret,
+                            )
+                        except SecretImportError:
+                            secret_store_failed = True
+                        if secret_store_failed:
+                            raise SubmissionError(
+                                "submission_search_secret_store_failed",
+                                500,
+                                response_metadata={
+                                    "initialization_status": "committed",
+                                    "search_secret_status": "pending",
+                                },
+                            ) from None
+                        self._forget_search_secret(search_secret_session_id)
+                        response["search_secret_status"] = "recovered"
                 return 200, self._with_search_discovery(
-                    self._replay_existing_store(
-                        target=target,
-                        expected_workspace_id=workspace_id,
-                        expected_run_id=run_id,
-                        request_workspace_prefix=request_workspace_prefix,
-                    ),
+                    response,
                     profile=profile,
                 )
             if authority_kind == "invalid_sqlite":
                 raise SubmissionError("control_store_integrity_invalid", 500)
             if self._target_has_content(target):
                 raise SubmissionError("workspace_target_exists", 409)
+
+            if profile.web_search_mode == "external_api":
+                search_secret = self._search_secret(
+                    session_id=search_secret_session_id,
+                    target=target,
+                    profile=profile,
+                )
 
             if manifest is not None:
                 session_id = _require_text(
@@ -666,35 +773,44 @@ class InitWebSubmitter:
                 force=False,
                 identity_factory=lambda: next(identities),
                 execution_authorization=execution_authorization,
+                source_discovery_authorization=source_discovery_authorization,
                 post_finalize_html=execution_authorization is not None,
             )
-            if search_secret is not None:
-                try:
-                    store_workspace_secret(
-                        workspace=target,
-                        key="TAVILY_API_KEY",
-                        value=search_secret,
-                    )
-                except SecretImportError as exc:
-                    raise SubmissionError(
-                        "submission_search_secret_store_failed", 500
-                    ) from exc
-                self._forget_search_secret(search_secret_session_id)
             try:
                 initialized = bootstrap.initialize_runnable_codex(
                     expected_adapter_loader=self._adapter_loader
                 )
             except RuntimeHostError as exc:
                 raise _runtime_submission_error(exc) from exc
-            return 200, self._with_search_discovery(
-                self._receipt_response(
-                    target=target,
-                    workspace_id=workspace_id,
-                    run_id=run_id,
-                    status="committed" if initialized.initialized else "replayed",
-                ),
-                profile=profile,
+            if search_secret is not None:
+                secret_store_failed = False
+                try:
+                    store_workspace_secret(
+                        workspace=target,
+                        key="TAVILY_API_KEY",
+                        value=search_secret,
+                    )
+                except SecretImportError:
+                    secret_store_failed = True
+                if secret_store_failed:
+                    raise SubmissionError(
+                        "submission_search_secret_store_failed",
+                        500,
+                        response_metadata={
+                            "initialization_status": "committed",
+                            "search_secret_status": "pending",
+                        },
+                    ) from None
+                self._forget_search_secret(search_secret_session_id)
+            response = self._receipt_response(
+                target=target,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                status="committed" if initialized.initialized else "replayed",
             )
+            if profile.web_search_mode == "external_api":
+                response["search_secret_status"] = "ready"
+            return 200, self._with_search_discovery(response, profile=profile)
 
 
 __all__ = [
