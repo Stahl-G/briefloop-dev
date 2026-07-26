@@ -550,6 +550,18 @@ class RuntimeHostService:
                             reason_code="commit_outcome_unknown",
                             transaction_ids=tuple(transaction_ids),
                         )
+                    if code == "checkout_publication_unsupported":
+                        refreshed = initialize_or_open_runtime(
+                            self.workspace,
+                            adapter_loader=self._adapter_loader,
+                        )
+                        return build_runtime_continuation_result(
+                            refreshed.verified,
+                            refreshed.action,
+                            status="needs_attention",
+                            reason_code=code,
+                            transaction_ids=tuple(transaction_ids),
+                        )
                     raise
                 transaction_ids.append(result.transaction_id)
                 continue

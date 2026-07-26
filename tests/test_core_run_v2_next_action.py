@@ -19,11 +19,20 @@ from multi_agent_brief.core_run_v2.errors import CoreRunError
 from multi_agent_brief.core_run_v2.next_action import classify_core_run_next_action
 from multi_agent_brief.core_run_v2.verifier import CoreRunDomainVerifier
 from multi_agent_brief.intake_v2.service import IntakeService
+from multi_agent_brief.product.projection_platform import (
+    supports_retained_directory_publication,
+)
 from multi_agent_brief.runtime_host_v2.errors import RuntimeHostError
 from multi_agent_brief.runtime_host_v2.initialization import (
     initialize_or_open_runtime,
 )
 from multi_agent_brief.sources.web_search import WebSearchProvider
+
+
+_REQUIRES_RETAINED_PUBLICATION = pytest.mark.skipif(
+    not supports_retained_directory_publication(),
+    reason="discovery reservation setup requires retained-directory publication",
+)
 
 
 def _verified(workspace, run_id):
@@ -55,6 +64,7 @@ def test_next_action_delegation_and_active_invocation_precedence(tmp_path) -> No
     assert reserved.stage_id == "scout"
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_next_action_recovers_only_exact_discovery_reservation(
     tmp_path,
     monkeypatch,
@@ -88,6 +98,7 @@ def test_next_action_recovers_only_exact_discovery_reservation(
     )
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_next_action_keeps_arbitrary_discovery_invocation_reserved(tmp_path) -> None:
     workspace = _discovery_workspace(tmp_path)
     action = _advance_discovery_to_source_action(workspace)
