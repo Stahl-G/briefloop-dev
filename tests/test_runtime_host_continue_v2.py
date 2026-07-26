@@ -34,6 +34,9 @@ from multi_agent_brief.core_run_v2.integrity import (
 from multi_agent_brief.core_run_v2.verifier import CoreRunDomainVerifier
 from multi_agent_brief.intake_v2.service import IntakeService
 from multi_agent_brief.product.init_web.submit import InitWebSubmitter
+from multi_agent_brief.product.projection_platform import (
+    supports_retained_directory_publication,
+)
 from multi_agent_brief.runtime_host_v2.codex import workspace_codex_adapter_loader
 from multi_agent_brief.runtime_host_v2.errors import RuntimeHostError
 from multi_agent_brief.runtime_host_v2.initialization import (
@@ -44,6 +47,12 @@ from multi_agent_brief.runtime_host_v2.submission import source_stage_root
 from multi_agent_brief.sources.base import SourceItem
 from multi_agent_brief.sources.search_backends.tavily import TavilyBackend
 from multi_agent_brief.sources.web_search import WebSearchProvider
+
+
+_REQUIRES_RETAINED_PUBLICATION = pytest.mark.skipif(
+    not supports_retained_directory_publication(),
+    reason="discovery promotion requires retained-directory publication",
+)
 
 
 def _body(*, authorized: bool) -> dict[str, object]:
@@ -315,6 +324,7 @@ def test_unauthorized_run_returns_typed_zero_write_attention(tmp_path: Path) -> 
     assert _revision(workspace) == revision
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_missing_runtime_secret_is_zero_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -342,6 +352,7 @@ def test_discovery_missing_runtime_secret_is_zero_write(
 
 @pytest.mark.parametrize("entrypoint", ["source", "pack"])
 @pytest.mark.parametrize("active_reserved_invocation", [False, True])
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_authority_rejects_public_source_files_before_sibling_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -590,6 +601,67 @@ def test_discovery_authorization_is_unique_per_run_in_schema(
         connection.close()
 
 
+def test_discovery_invocation_publication_stop_is_typed_and_retry_stable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    service = _service(workspace)
+    planner = service.continue_authorized()
+    assert planner.status == "role_work_required"
+    assert planner.trace.envelope_path is not None
+    proposal_path = (
+        workspace / planner.trace.envelope_path
+    ).parent / "source_candidates.yaml"
+    proposal_path.write_text(
+        "version: 1\ncandidates:\n  - route: web-search\n",
+        encoding="utf-8",
+    )
+    action = service.next_action()
+    assert action.effect_kind == "invocation_accept_or_fail"
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot_before = store.load_snapshot(head.current_run_id)
+    active_before = tuple(
+        item for item in snapshot_before.invocations if item.status == "active"
+    )
+    assert len(active_before) == 1
+
+    def unsupported_acceptance(*_args, **_kwargs):
+        raise RuntimeHostError("checkout_publication_unsupported")
+
+    def forbidden_provider(*_args, **_kwargs):
+        pytest.fail("provider must not run before proposal acceptance")
+
+    monkeypatch.setattr(service, "accept_invocation", unsupported_acceptance)
+    monkeypatch.setattr(WebSearchProvider, "collect", forbidden_provider)
+
+    for _ in range(2):
+        stopped = service.continue_authorized()
+        assert stopped.status == "needs_attention"
+        assert stopped.reason_code == "checkout_publication_unsupported"
+        assert stopped.store_revision == snapshot_before.store_revision
+        assert stopped.trace.next_action == action
+        assert stopped.trace.transaction_ids == []
+        with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+            head = store.load_workspace_run_head()
+            assert head is not None
+            snapshot_after = store.load_snapshot(head.current_run_id)
+        assert snapshot_after == snapshot_before
+        assert tuple(
+            item for item in snapshot_after.invocations if item.status == "active"
+        ) == active_before
+
+    def unrelated_failure(*_args, **_kwargs):
+        raise RuntimeHostError("runtime_proposal_invalid")
+
+    monkeypatch.setattr(service, "accept_invocation", unrelated_failure)
+    with pytest.raises(RuntimeHostError, match="runtime_proposal_invalid"):
+        service.continue_authorized()
+
+
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_continue_promotes_one_mixed_pack_atomically(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -679,6 +751,7 @@ def test_discovery_continue_promotes_one_mixed_pack_atomically(
     assert _revision(workspace) == revision
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_workspace_env_reaches_real_tavily_boundary_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -746,6 +819,7 @@ def test_discovery_workspace_env_reaches_real_tavily_boundary_once(
     assert b"tvly-runtime-secret-sentinel" not in database
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_exact_receipt_replay_precedes_secret_and_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -774,6 +848,7 @@ def test_discovery_exact_receipt_replay_precedes_secret_and_provider(
     assert not source_stage_root(workspace, stage_identity).exists()
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_precommit_crash_reuses_staged_bytes_before_secret_or_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -815,6 +890,7 @@ def test_discovery_precommit_crash_reuses_staged_bytes_before_secret_or_provider
     assert len(snapshot.run_execution_authorizations) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -906,6 +982,7 @@ def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
     assert snapshot_after == snapshot_before
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_active_invocation_reuses_receipt_owned_stage_without_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -955,6 +1032,7 @@ def test_discovery_active_invocation_reuses_receipt_owned_stage_without_provider
 
 
 @pytest.mark.parametrize("stage_damage", ["missing", "tampered"])
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_active_invocation_invalid_stage_fails_without_provider_recall(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1015,6 +1093,7 @@ def test_discovery_active_invocation_invalid_stage_fails_without_provider_recall
     assert len(failed) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_tampered_precommit_stage_fails_closed_without_provider_recall(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1060,6 +1139,7 @@ def test_discovery_tampered_precommit_stage_fails_closed_without_provider_recall
     assert snapshot.run_execution_authorizations == ()
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_commit_outcome_unknown_replays_without_provider_recall(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1104,6 +1184,7 @@ def test_discovery_commit_outcome_unknown_replays_without_provider_recall(
     assert len(snapshot.run_execution_authorizations) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_promotion_failure_rolls_back_all_authority_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1163,6 +1244,7 @@ def test_discovery_promotion_failure_rolls_back_all_authority_rows(
     assert len(failures) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_all_snippets_fail_without_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1193,6 +1275,7 @@ def test_discovery_all_snippets_fail_without_promotion(
     ) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_empty_provider_result_fails_without_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1223,6 +1306,7 @@ def test_discovery_empty_provider_result_fails_without_promotion(
     ) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_malformed_provider_result_fails_without_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1255,6 +1339,7 @@ def test_discovery_malformed_provider_result_fails_without_promotion(
     ) == 1
 
 
+@_REQUIRES_RETAINED_PUBLICATION
 def test_discovery_provider_failure_records_one_typed_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
