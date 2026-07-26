@@ -28,6 +28,8 @@ from multi_agent_brief.contracts.v2 import (
     InvocationFailureRequest,
     OwnedArtifactSubmissionRecord,
     ProposalSourceBinding,
+    RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     ScreenedCandidatesProposal,
     SourceCommitRequest,
     SourcePackCommitMember,
@@ -61,6 +63,9 @@ from multi_agent_brief.intake_v2.policy import (
     evaluate_source_eligibility,
 )
 from multi_agent_brief.intake_v2.scratch import ScratchReader, parse_json_object
+from multi_agent_brief.core_run_v2.policy import (
+    EXECUTION_AUTHORIZATION_MANIFEST_ARTIFACT_ID,
+)
 
 
 _Clock = Callable[[], datetime]
@@ -96,6 +101,21 @@ class _CoreAuthorizedSourcePack:
     manifest: ExecutionSourceManifest
     source_manifest_sha256: str
     contents: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class _CoreDiscoverySourcePack:
+    """Host-observed bytes bound to one Store-owned discovery authorization."""
+
+    request_id: str
+    run_id: str
+    invocation_id: str
+    expected_store_revision: int
+    manifest: ExecutionSourceManifest
+    source_manifest_sha256: str
+    proposals: tuple[SourceProposal, ...]
+    contents: tuple[bytes, ...]
+    raw_payloads: tuple[bytes, ...]
 
 
 class IntakeService:
@@ -228,6 +248,162 @@ class IntakeService:
                 store, request=request, prepared=prepared, request_fingerprint=fingerprint,
                 snapshot=snapshot, invocation=invocation, owner_stage=owner_stage,
                 core_run_bound=core_run_bound, authorization_manifest=manifest,
+            )
+
+    def _commit_discovery_source_pack_from_core(
+        self,
+        input: _CoreDiscoverySourcePack,
+    ) -> IntakeResult:
+        """Atomically promote one verified discovery pack without file authority."""
+
+        if len(
+            {
+                len(input.proposals),
+                len(input.contents),
+                len(input.raw_payloads),
+            }
+        ) != 1:
+            raise IntakeError("source_provider_result_invalid")
+        if len(input.proposals) != len(input.manifest.members):
+            raise IntakeError("source_provider_result_invalid")
+        canonical_manifest = canonical_json_bytes(
+            input.manifest.model_dump(mode="json", exclude_unset=False)
+        )
+        if sha256_hex(canonical_manifest) != input.source_manifest_sha256:
+            raise IntakeError("source_provider_result_invalid")
+
+        members: list[SourcePackCommitMember] = []
+        prepared: list[_PreparedSourcePackMember] = []
+        for frozen, proposal, content, raw_payload in zip(
+            input.manifest.members,
+            input.proposals,
+            input.contents,
+            input.raw_payloads,
+            strict=True,
+        ):
+            if (
+                proposal.run_id != input.run_id
+                or proposal.source_id != frozen.source_id
+                or proposal.source_manifest_sha256 != input.source_manifest_sha256
+                or not _proposal_matches_discovery_manifest(proposal, frozen)
+                or sha256_hex(content) != proposal.content_sha256
+                or sha256_hex(raw_payload) != proposal.raw_payload_sha256
+            ):
+                raise IntakeError("source_provider_result_invalid")
+            root = f"scratch/{input.invocation_id}/sources/{frozen.source_id}"
+            member = SourcePackCommitMember.model_validate(
+                {
+                    "member_id": frozen.source_id,
+                    "proposal_path": f"{root}/source_proposal.json",
+                    "content_path": f"{root}/source_content.bin",
+                    "raw_payload_path": f"{root}/source_raw.json",
+                },
+                strict=True,
+            )
+            try:
+                eligible, reason = evaluate_source_eligibility(
+                    proposal,
+                    raw_payload_present=True,
+                )
+            except SourcePolicyError as exc:
+                raise IntakeError("source_provider_result_invalid") from exc
+            members.append(member)
+            prepared.append(
+                _PreparedSourcePackMember(
+                    member=member,
+                    proposal=proposal,
+                    content_bytes=content,
+                    raw_bytes=raw_payload,
+                    claims_eligible=eligible,
+                    eligibility_reason=reason,
+                )
+            )
+        if not any(item.claims_eligible for item in prepared):
+            raise IntakeError("source_pack_empty")
+
+        request = SourcePackCommitRequest.model_validate(
+            {
+                "schema_version": SourcePackCommitRequest.schema_id,
+                "request_id": input.request_id,
+                "run_id": input.run_id,
+                "invocation_id": input.invocation_id,
+                "members": [
+                    item.model_dump(mode="json", exclude_unset=False)
+                    for item in members
+                ],
+                "manifest_path": (
+                    f"scratch/{input.invocation_id}/source_manifest.json"
+                ),
+                "expected_manifest_sha256": input.source_manifest_sha256,
+                "expected_store_revision": input.expected_store_revision,
+            },
+            strict=True,
+        )
+        request_fingerprint = canonical_fingerprint(
+            {
+                "lane": "discovery_source_pack",
+                "request": request.model_dump(mode="json", exclude_unset=False),
+                "manifest_sha256": input.source_manifest_sha256,
+                "members": [
+                    {
+                        "member_id": item.member.member_id,
+                        "proposal_sha256": sha256_hex(
+                            canonical_json_bytes(
+                                item.proposal.model_dump(
+                                    mode="json",
+                                    exclude_unset=False,
+                                )
+                            )
+                        ),
+                        "content_sha256": item.proposal.content_sha256,
+                        "raw_payload_sha256": item.proposal.raw_payload_sha256,
+                    }
+                    for item in prepared
+                ],
+            }
+        )
+        with self._open_store() as store:
+            replay = self._resolve_replay(
+                store,
+                run_id=request.run_id,
+                request_id=request.request_id,
+                request_fingerprint=request_fingerprint,
+            )
+            if replay is not None:
+                return replay
+            snapshot, invocation, owner_stage, core_run_bound = (
+                self._trusted_submission_context(
+                    store,
+                    INTAKE_LANES["source"],
+                    request,
+                )
+            )
+            if (
+                snapshot.run_execution_authorizations
+                or len(snapshot.run_source_discovery_authorizations) != 1
+            ):
+                raise IntakeError("source_discovery_authorization_invalid")
+            discovery = snapshot.run_source_discovery_authorizations[0]
+            if (
+                discovery.run_id != request.run_id
+                or discovery.provider_id != "tavily"
+                or discovery.execution_owner != "deterministic"
+                or discovery.completion_target != "finalized_local"
+                or discovery.repair_budget != 1
+            ):
+                raise IntakeError("source_discovery_authorization_invalid")
+            return self._commit_source_pack(
+                store,
+                request=request,
+                prepared=prepared,
+                request_fingerprint=request_fingerprint,
+                snapshot=snapshot,
+                invocation=invocation,
+                owner_stage=owner_stage,
+                core_run_bound=core_run_bound,
+                authorization_manifest=input.manifest,
+                discovery_authorization=discovery,
+                discovery_manifest_bytes=canonical_manifest,
             )
 
     def submit_proposal(
@@ -685,7 +861,10 @@ class IntakeService:
             if receipt is not None:
                 raise ControlStoreCommitOutcomeUnknown("commit_outcome_unknown") from exc
             raise IntakeError("control_store_integrity_invalid") from exc
-        if not snapshot.run_execution_authorizations:
+        if not (
+            snapshot.run_execution_authorizations
+            or snapshot.run_source_discovery_authorizations
+        ):
             return
         try:
             self._verify_core_run(store, run_id)
@@ -1294,6 +1473,8 @@ class IntakeService:
         owner_stage: str,
         core_run_bound: bool,
         authorization_manifest: ExecutionSourceManifest | None,
+        discovery_authorization: RunSourceDiscoveryAuthorization | None = None,
+        discovery_manifest_bytes: bytes | None = None,
     ) -> IntakeResult:
         now = self._now()
         unit = store.begin(
@@ -1426,6 +1607,72 @@ class IntakeService:
 
         classification_submission: OwnedArtifactSubmissionRecord | None = None
         if authorization_manifest is not None:
+            if discovery_authorization is not None:
+                if discovery_manifest_bytes is None:
+                    raise IntakeError("source_provider_result_invalid")
+                manifest_digest = sha256_hex(discovery_manifest_bytes)
+                manifest_artifact, manifest_revision = _artifact_pair(
+                    run_id=request.run_id,
+                    artifact_id=EXECUTION_AUTHORIZATION_MANIFEST_ARTIFACT_ID,
+                    revision=1,
+                    path=_blob_workspace_path(manifest_digest),
+                    artifact_format="json",
+                    sha256=manifest_digest,
+                    size_bytes=len(discovery_manifest_bytes),
+                    producer_id=owner_stage,
+                    created_at=now,
+                    required=True,
+                )
+                if not sources:
+                    raise IntakeError("source_provider_result_invalid")
+                authorization_event_id = sources[0].acquisition_event_id
+                unit.put_artifact(manifest_artifact)
+                unit.put_artifact_revision(
+                    manifest_revision,
+                    discovery_manifest_bytes,
+                )
+                unit.reference_run_source_discovery_authorization(
+                    discovery_authorization
+                )
+                unit.put_run_execution_authorization(
+                    RunExecutionAuthorization.model_validate(
+                        {
+                            "schema_version": RunExecutionAuthorization.schema_id,
+                            "authorization_id": _derived_id(
+                                "EXEC-AUTH-DISCOVERY",
+                                request.request_id,
+                                request_fingerprint,
+                            ),
+                            "run_id": request.run_id,
+                            "workspace_id": discovery_authorization.workspace_id,
+                            "run_contract_fingerprint": (
+                                discovery_authorization.run_contract_fingerprint
+                            ),
+                            "run_direction_fingerprint": (
+                                discovery_authorization.run_direction_fingerprint
+                            ),
+                            "completion_target": (
+                                discovery_authorization.completion_target
+                            ),
+                            "source_manifest_artifact": {
+                                "artifact_id": (
+                                    EXECUTION_AUTHORIZATION_MANIFEST_ARTIFACT_ID
+                                ),
+                                "revision": 1,
+                            },
+                            "source_manifest_sha256": manifest_digest,
+                            "source_manifest_member_count": len(
+                                authorization_manifest.members
+                            ),
+                            "repair_budget": discovery_authorization.repair_budget,
+                            "authorization_event_id": authorization_event_id,
+                            "accepted_transaction_id": request.request_id,
+                            "request_fingerprint": request_fingerprint,
+                            "created_at": now,
+                        },
+                        strict=True,
+                    )
+                )
             classification_submission = _stage_authorized_input_classification(
                 unit,
                 snapshot_artifacts=snapshot.artifacts,
@@ -1786,6 +2033,36 @@ def _proposal_matches_execution_manifest(proposal: SourceProposal, expected) -> 
         and proposal.resolved_at == expected.resolved_at
         and proposal.raw_payload_sha256 is None
         and proposal.raw_payload_media_type is None
+    )
+
+
+def _proposal_matches_discovery_manifest(
+    proposal: SourceProposal,
+    expected,
+) -> bool:
+    return (
+        proposal.manifest_local_file == expected.input_path
+        and proposal.content_sha256 == expected.content_sha256
+        and proposal.content_media_type == expected.content_media_type
+        and proposal.origin_type == expected.origin_type
+        and proposal.acquisition_method == expected.acquisition_method
+        and proposal.material_kind == expected.material_kind
+        and proposal.provider == expected.provider
+        and proposal.locator == expected.locator
+        and proposal.title == expected.title
+        and proposal.publisher == expected.publisher
+        and proposal.published_at == expected.published_at
+        and proposal.retrieved_at == expected.retrieved_at
+        and proposal.source_category == expected.source_category
+        and proposal.retrieval_source_type == expected.retrieval_source_type
+        and proposal.underlying_evidence_type == expected.underlying_evidence_type
+        and proposal.raw_underlying_evidence_type
+        == expected.raw_underlying_evidence_type
+        and proposal.document_kind == expected.document_kind
+        and proposal.opened_at == expected.opened_at
+        and proposal.resolved_at == expected.resolved_at
+        and proposal.raw_payload_sha256 is not None
+        and proposal.raw_payload_media_type == "application/json"
     )
 
 

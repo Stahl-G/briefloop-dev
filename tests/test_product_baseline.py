@@ -36,6 +36,21 @@ def test_product_baseline_check_runs_clean() -> None:
     assert "ALL CHECKS PASSED" in result.stdout
 
 
+def test_runtime_first_docs_preserve_platform_boundary_truth() -> None:
+    architecture = (ROOT / "docs" / "architecture-status.md").read_text(
+        encoding="utf-8"
+    )
+    support = (ROOT / "docs" / "support-matrix.md").read_text(encoding="utf-8")
+
+    for text in (architecture, support):
+        assert "POSIX/macOS" in text
+        assert "Windows" in text
+        assert "checkout_publication_unsupported" in text
+        assert "before any Tavily call" in text or "before any provider call" in text
+        assert "no source promotion" in text or "zero source promotion" in text
+        assert "delivery" in text
+
+
 def _write_product_boundary_fixture(module, root: Path) -> None:
     for rel_path, phrases in module.REQUIRED_DOC_BOUNDARY_PHRASES.items():
         path = root / rel_path

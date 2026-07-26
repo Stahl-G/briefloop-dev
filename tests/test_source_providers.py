@@ -7,7 +7,11 @@ from io import BytesIO
 
 
 from multi_agent_brief.sources.base import SourceConfig, SourceItem, SourceQuery, SOURCE_PROFILES
-from multi_agent_brief.sources.search_backends.base import SearchResult
+from multi_agent_brief.sources.search_backends.base import (
+    SearchBackendError,
+    SearchResult,
+)
+from multi_agent_brief.sources.search_backends.tavily import TavilyBackend
 from multi_agent_brief.sources.manual import ManualProvider
 from multi_agent_brief.sources.rss import RssProvider
 from multi_agent_brief.sources.web_search import WebSearchProvider
@@ -324,6 +328,84 @@ def test_web_search_collect_uses_workspace_env_for_known_backend_key(tmp_path, m
     assert len(items) == 1
     assert items[0].metadata["backend"] == "env_fake"
     assert os.environ.get("TAVILY_API_KEY") is None
+
+
+def test_tavily_requests_and_preserves_raw_content_separately(monkeypatch):
+    captured: dict[str, object] = {}
+    sentinel = "test-only-tavily-key"
+
+    class _FakeResponse:
+        def read(self):
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Durable result",
+                            "url": "https://example.com/durable",
+                            "content": "search snippet",
+                            "raw_content": "retrieved durable page extract",
+                            "score": 0.9,
+                        },
+                        {
+                            "title": "Snippet result",
+                            "url": "https://example.com/snippet",
+                            "content": "snippet only",
+                            "raw_content": "",
+                            "score": 0.8,
+                        },
+                    ]
+                }
+            ).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _urlopen(request, timeout=30):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    monkeypatch.setenv("TAVILY_API_KEY", sentinel)
+
+    results = TavilyBackend().search("test query", max_results=2)
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["include_raw_content"] is True
+    assert payload["api_key"] == sentinel
+    assert results[0].snippet == "search snippet"
+    assert results[0].raw_content == "retrieved durable page extract"
+    assert results[0].metadata["evidence_quality"] == "partial_extract"
+    assert results[1].snippet == "snippet only"
+    assert results[1].raw_content is None
+    assert results[1].metadata["evidence_quality"] == "snippet"
+    assert sentinel not in repr(results)
+
+
+def test_tavily_transport_failure_is_stable_and_value_free(monkeypatch):
+    sentinel = "tvly-secret-must-not-escape"
+
+    def _raise_transport_error(request, timeout=30):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise_transport_error)
+    monkeypatch.setenv("TAVILY_API_KEY", "test-only-tavily-key")
+
+    try:
+        TavilyBackend().search("test query")
+    except SearchBackendError as exc:
+        assert str(exc) == "Tavily search failed"
+        assert exc.backend == "tavily"
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+        assert sentinel not in str(exc)
+        assert sentinel not in repr(exc)
+    else:
+        raise AssertionError("transport failure must remain a typed failure")
 
 
 # --- Non-stub providers (api_news, filings, mcp, cli) ---

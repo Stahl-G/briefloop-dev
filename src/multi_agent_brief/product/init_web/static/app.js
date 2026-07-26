@@ -146,11 +146,15 @@
             cf_sub_replayed: "相同初始化请求已提交过——返回原收据，不产生第二个工作区。",
             cf_sub_conflict: "同一 request_id 提交了不同内容。已拒绝，零写入。",
             cf_sub_error: "服务端拒绝了本次提交，未产生任何写入。原因码如上所示。",
+            cf_secret_pending: "工作区初始化已经提交，但 Tavily 凭据尚未成功写入。请原样重试本次请求以恢复凭据；不会重复初始化。",
+            cf_secret_ready: "Tavily 凭据状态：已就绪。",
+            cf_secret_recovered: "Tavily 凭据状态：已从原初始化请求恢复。",
             cf_submitting: "正在提交……",
             cf_next: "本地终点与第一步：",
             cf_again: "再次提交同一请求（replay）",
             cf_close: "关闭，修改后重试",
             cf_note: "目标为 finalized_local，预授权编辑修复预算为 1。此页仅确认初始化；已启动的 Codex 控制器会在命令行继续。",
+            cf_note_discovery: "已记录 Tavily 自动来源发现授权；当前控制器将继续检索、冻结来源并推进工作流。本页不表示执行授权已完成，也不表示报告、门禁、审批或交付已经完成。",
             cf_note_manual: "本次初始化没有 RunExecutionAuthorization；后续为手动继续，不声明 finalized_local 或修复预算。"
         },
         en: {
@@ -263,11 +267,15 @@
             cf_sub_replayed: "This exact initialization request was already committed — original receipt returned, no second workspace.",
             cf_sub_conflict: "Same request_id with a different payload. Rejected with zero writes.",
             cf_sub_error: "The server rejected this submission; nothing was written. The reason code is shown above.",
+            cf_secret_pending: "Workspace initialization committed, but Tavily credential persistence is still pending. Retry this exact request to recover the credential without initializing again.",
+            cf_secret_ready: "Tavily credential status: ready.",
+            cf_secret_recovered: "Tavily credential status: recovered from the original initialization request.",
             cf_submitting: "Submitting…",
             cf_next: "Local target and first action: ",
             cf_again: "Resubmit the same request (replay)",
             cf_close: "Close, change something, retry",
             cf_note: "The target is finalized_local with one preauthorized editor repair. This page confirms initialization only; the initiating Codex controller continues in the terminal.",
+            cf_note_discovery: "Tavily source-discovery authority is recorded. The current controller continues retrieval, source freezing, and the workflow. This page does not claim completed execution authorization, report, gates, approval, or delivery.",
             cf_note_manual: "This initialization has no RunExecutionAuthorization; continuation is manual and does not claim finalized_local or a repair budget."
         }
     };
@@ -1698,7 +1706,7 @@
             return;
         }
         var reason = body && body.reason_code ? String(body.reason_code) : "unknown_error";
-        paintError(reason);
+        paintError(reason, body);
     }
 
     function paintSubmitting() {
@@ -1724,9 +1732,15 @@
         var receiptRows = [["workspace_id", response.workspace_id],
          ["run_id", response.run_id],
          ["transaction_id", response.transaction_id]];
-        if (response.execution_authorized === true) {
+        if (
+            response.execution_authorized === true
+            || response.source_discovery_authorized === true
+        ) {
             receiptRows.push(["completion_target", response.completion_target]);
             receiptRows.push(["repair_budget", response.repair_budget]);
+        }
+        if (response.search_secret_status === "ready" || response.search_secret_status === "recovered") {
+            receiptRows.push(["search_secret_status", response.search_secret_status]);
         }
         receiptRows.forEach(function (kv) {
             var line = el("div");
@@ -1739,8 +1753,7 @@
         var next = el("p", "cf-next");
         next.appendChild(el("span", null, t("cf_next")));
         var firstAction = response.first_action || {};
-        var discovery = response.source_discovery || {};
-        var continuationLabel = discovery.backend === "tavily"
+        var continuationLabel = response.source_discovery_authorized === true
             ? "Tavily automatic discovery · "
             : "manual continuation · ";
         next.appendChild(el("code", null,
@@ -1752,6 +1765,13 @@
             var progress = el("p", "cf-note");
             progress.textContent = String(response.progress.reason_code || response.progress.status || "initialized");
             cfBody.appendChild(progress);
+        }
+        if (response.search_secret_status === "ready" || response.search_secret_status === "recovered") {
+            cfBody.appendChild(el(
+                "p",
+                "cf-note",
+                t(response.search_secret_status === "recovered" ? "cf_secret_recovered" : "cf_secret_ready")
+            ));
         }
 
         var actions = el("div", "cf-actions");
@@ -1765,21 +1785,42 @@
         cfBody.appendChild(el(
             "p",
             "cf-note",
-            t(response.execution_authorized === true ? "cf_note" : "cf_note_manual")
+            t(
+                response.execution_authorized === true
+                    ? "cf_note"
+                    : (
+                        response.source_discovery_authorized === true
+                            ? "cf_note_discovery"
+                            : "cf_note_manual"
+                    )
+            )
         ));
     }
 
-    function paintError(reasonCode) {
+    function paintError(reasonCode, response) {
         cfBody.replaceChildren();
         var conflict = reasonCode === "submission_replay_conflict";
+        var secretPending = reasonCode === "submission_search_secret_store_failed"
+            && response
+            && response.initialization_status === "committed"
+            && response.search_secret_status === "pending";
         var status = el("div", "cf-status cf-conflict");
         status.id = "cf-title";
         status.appendChild(el("span", "cf-icon cf-icon-block", "✗"));
         status.appendChild(el("span", null, t(conflict ? "cf_conflict" : "cf_error")));
         cfBody.appendChild(status);
         cfBody.appendChild(el("div", "cf-reason", reasonCode));
-        cfBody.appendChild(el("p", "cf-sub", t(conflict ? "cf_sub_conflict" : "cf_sub_error")));
+        cfBody.appendChild(el(
+            "p",
+            "cf-sub",
+            t(secretPending ? "cf_secret_pending" : (conflict ? "cf_sub_conflict" : "cf_sub_error"))
+        ));
         var actions = el("div", "cf-actions");
+        if (secretPending) {
+            var again = el("button", "btn-primary", t("cf_again"));
+            again.addEventListener("click", submitRequest);
+            actions.appendChild(again);
+        }
         var close = el("button", "btn-primary", t("cf_close"));
         close.addEventListener("click", function () { overlay.hidden = true; });
         actions.appendChild(close);

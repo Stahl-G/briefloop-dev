@@ -74,6 +74,7 @@ class InitWebSubmissionOutcome:
     transaction_id: str
     status: str
     execution_authorized: bool
+    source_discovery_authorized: bool
 
 
 @dataclass
@@ -150,6 +151,9 @@ def create_init_web_server(
             "run_id": response.get("run_id"),
             "transaction_id": response.get("transaction_id"),
             "execution_authorized": response.get("execution_authorized") is True,
+            "source_discovery_authorized": (
+                response.get("source_discovery_authorized") is True
+            ),
             "first_action": {
                 "action_kind": action_payload.get("action_kind"),
                 "effect_kind": action_payload.get("effect_kind"),
@@ -164,7 +168,10 @@ def create_init_web_server(
                 "reason_code": progress_payload.get("reason_code"),
             },
         }
-        if response.get("execution_authorized") is True:
+        if (
+            response.get("execution_authorized") is True
+            or response.get("source_discovery_authorized") is True
+        ):
             friendly["completion_target"] = response.get("completion_target")
             friendly["repair_budget"] = response.get("repair_budget")
         source_discovery = response.get("source_discovery")
@@ -175,6 +182,9 @@ def create_init_web_server(
                 "backend": source_discovery.get("backend"),
                 "api_key_env": source_discovery.get("api_key_env"),
             }
+        search_secret_status = response.get("search_secret_status")
+        if search_secret_status in {"ready", "recovered"}:
+            friendly["search_secret_status"] = search_secret_status
         return friendly
 
     def _shutdown_soon() -> None:
@@ -334,6 +344,7 @@ def create_init_web_server(
                 status, response = exc.http_status, {
                     "ok": False,
                     "reason_code": exc.error_code,
+                    **exc.response_metadata,
                 }
             if (
                 target.path == "/api/v1/submit"
@@ -355,6 +366,9 @@ def create_init_web_server(
                     status=str(response.get("status")),
                     execution_authorized=(
                         response.get("execution_authorized") is True
+                    ),
+                    source_discovery_authorized=(
+                        response.get("source_discovery_authorized") is True
                     ),
                 )
                 with outcome_lock:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -11,8 +12,10 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from multi_agent_brief.product.init_web.server import (
+    InitWebError,
     MAX_JSON_BODY_BYTES,
     SESSION_TOKEN_HEADER,
+    _verify_assets,
     create_init_web_server,
 )
 from multi_agent_brief.product.init_web.submit import (
@@ -28,11 +31,13 @@ class _StubSubmitter:
         *,
         authorized: bool = True,
         tavily_discovery: bool = False,
+        discovery_authorized: bool | None = None,
     ) -> None:
         self.calls: list[object] = []
         self._response_status = response_status
         self._authorized = authorized
         self._tavily_discovery = tavily_discovery
+        self._discovery_authorized = discovery_authorized
 
     def configure_search_secret(
         self, *, session_id: str, body: object
@@ -49,6 +54,15 @@ class _StubSubmitter:
         self.calls.append(body)
         if self._response_status == "conflict":
             raise SubmissionError("submission_replay_conflict", 409)
+        if self._response_status == "secret_pending":
+            raise SubmissionError(
+                "submission_search_secret_store_failed",
+                500,
+                response_metadata={
+                    "initialization_status": "committed",
+                    "search_secret_status": "pending",
+                },
+            )
         response: dict[str, object] = {
             "ok": True,
             "status": self._response_status,
@@ -74,6 +88,13 @@ class _StubSubmitter:
         else:
             response["completion_target"] = None
             response["repair_budget"] = None
+        if self._discovery_authorized is not None:
+            response["source_discovery_authorized"] = (
+                self._discovery_authorized
+            )
+            if self._discovery_authorized:
+                response["completion_target"] = "finalized_local"
+                response["repair_budget"] = 1
         if self._tavily_discovery:
             response["source_discovery"] = {
                 "mode": "automatic",
@@ -87,6 +108,21 @@ class _StubSubmitter:
 def _credentials(url: str) -> tuple[str, str]:
     fragment = parse_qs(urlsplit(url).fragment)
     return fragment["token"][0], fragment["session"][0]
+
+
+def test_init_web_asset_verification_rejects_tampered_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multi_agent_brief.product.init_web import server as server_module
+
+    source = Path(server_module.__file__).parent / "static"
+    shutil.copytree(source, tmp_path / "static")
+    (tmp_path / "static" / "app.js").write_bytes(b"tampered")
+    monkeypatch.setattr(server_module, "files", lambda _package: tmp_path)
+
+    with pytest.raises(InitWebError, match="init_web_asset_hash_mismatch"):
+        _verify_assets()
 
 
 def _request(
@@ -146,6 +182,11 @@ def test_get_assets_and_security_headers(server) -> None:
     assert b"finalized_local" in body
     assert b"payload.repair_budget = 1" in body
     assert b'/api/v1/search-secret' in body
+    assert b"submission_search_secret_store_failed" in body
+    assert b'search_secret_status === "pending"' in body
+    assert b'search_secret_status === "recovered"' in body
+    assert b"nothing was written" in body
+    assert b"Workspace initialization committed" in body
     assert (
         b'web_search_mode: c.source === "public_web" ? "external_api" : "disabled"'
         in body
@@ -286,6 +327,7 @@ def test_post_success_returns_real_response(server) -> None:
     assert payload["status"] == "committed"
     assert payload["transaction_id"] == "REQ-CX-INIT-x"
     assert payload["execution_authorized"] is True
+    assert payload["source_discovery_authorized"] is False
     assert payload["completion_target"] == "finalized_local"
     assert payload["repair_budget"] == 1
     assert "workspace" not in payload
@@ -315,6 +357,7 @@ def test_manual_success_never_claims_authorized_terminal_or_budget() -> None:
         payload = json.loads(body)
         assert status == 200
         assert payload["execution_authorized"] is False
+        assert payload["source_discovery_authorized"] is False
         assert "completion_target" not in payload
         assert "repair_budget" not in payload
         assert b"finalized_local" not in body
@@ -323,6 +366,44 @@ def test_manual_success_never_claims_authorized_terminal_or_budget() -> None:
 
 
 def test_public_web_success_reports_automatic_tavily_discovery() -> None:
+    instance = create_init_web_server(
+        _StubSubmitter(
+            authorized=False,
+            tavily_discovery=True,
+            discovery_authorized=True,
+        ),
+        exit_on_success=False,
+    )
+    instance.start()
+    try:
+        token, session = _credentials(instance.url)
+        status, _headers, body = _request(
+            instance,
+            "POST",
+            f"/api/v1/submit?session_id={session}",
+            body=_submit_body(),
+            headers={
+                "Content-Type": "application/json",
+                SESSION_TOKEN_HEADER: token,
+            },
+        )
+        payload = json.loads(body)
+        assert status == 200
+        assert payload["execution_authorized"] is False
+        assert payload["source_discovery_authorized"] is True
+        assert payload["completion_target"] == "finalized_local"
+        assert payload["repair_budget"] == 1
+        assert payload["source_discovery"] == {
+            "mode": "automatic",
+            "profile": "llm_decide",
+            "backend": "tavily",
+            "api_key_env": "TAVILY_API_KEY",
+        }
+    finally:
+        instance.close()
+
+
+def test_tavily_display_metadata_does_not_infer_discovery_authority() -> None:
     instance = create_init_web_server(
         _StubSubmitter(authorized=False, tavily_discovery=True),
         exit_on_success=False,
@@ -342,13 +423,9 @@ def test_public_web_success_reports_automatic_tavily_discovery() -> None:
         )
         payload = json.loads(body)
         assert status == 200
-        assert payload["execution_authorized"] is False
-        assert payload["source_discovery"] == {
-            "mode": "automatic",
-            "profile": "llm_decide",
-            "backend": "tavily",
-            "api_key_env": "TAVILY_API_KEY",
-        }
+        assert payload["source_discovery_authorized"] is False
+        assert instance.outcome is not None
+        assert instance.outcome.source_discovery_authorized is False
     finally:
         instance.close()
 
@@ -494,6 +571,37 @@ def test_submission_error_maps_to_status_and_reason(server) -> None:
         assert json.loads(body)["reason_code"] == "submission_replay_conflict"
     finally:
         conflict.close()
+
+
+def test_pending_search_secret_reports_committed_recovery_state() -> None:
+    instance = create_init_web_server(
+        _StubSubmitter(response_status="secret_pending"),
+        exit_on_success=True,
+    )
+    instance.start()
+    try:
+        token, session = _credentials(instance.url)
+        status, _headers, body = _request(
+            instance,
+            "POST",
+            f"/api/v1/submit?session_id={session}",
+            body=_submit_body(),
+            headers={
+                "Content-Type": "application/json",
+                SESSION_TOKEN_HEADER: token,
+            },
+        )
+        assert status == 500
+        assert json.loads(body) == {
+            "ok": False,
+            "reason_code": "submission_search_secret_store_failed",
+            "initialization_status": "committed",
+            "search_secret_status": "pending",
+        }
+        assert instance.outcome is None
+        assert instance._thread is not None and instance._thread.is_alive()
+    finally:
+        instance.close()
 
 
 def test_server_exits_on_success_when_configured() -> None:
