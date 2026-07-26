@@ -65,6 +65,7 @@ from multi_agent_brief.core_run_v2.artifacts import (
     _input_classification_bytes,
 )
 from multi_agent_brief.core_run_v2.claims import ClaimFreezeService
+from multi_agent_brief.core_run_v2.errors import CoreRunError
 from multi_agent_brief.core_run_v2.gates import GateEvaluationService
 from multi_agent_brief.core_run_v2.gate_repair import (
     GateRepairService,
@@ -80,6 +81,7 @@ from multi_agent_brief.core_run_v2.policy import (
     core_role_topology_policy,
     derived_id,
 )
+from multi_agent_brief.core_run_v2.publication_platform import capability_profile
 from multi_agent_brief.core_run_v2.service import CoreRunService
 from multi_agent_brief.core_run_v2.recovery import (
     CoreRunRecoveryService,
@@ -2193,6 +2195,11 @@ class RuntimeHostService:
                 raise RuntimeHostError(
                     "source_provider_result_invalid"
                 ) from None
+        try:
+            capability_profile(self.workspace)
+        except CoreRunError as exc:
+            raise RuntimeHostError(exc.code) from None
+        if stage is None:
             if not known_env_key_is_set(discovery.secret_env_name, self.workspace):
                 raise RuntimeHostError("source_provider_secret_unavailable")
             try:

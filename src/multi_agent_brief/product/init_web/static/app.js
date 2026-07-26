@@ -139,7 +139,9 @@
             preview_formats: "本地输出：",
             cf_committed: "已提交 · committed",
             cf_replayed: "重放 · replayed",
-            cf_replayed_badge: "replayed · 无新写入",
+            cf_replayed_receipt_badge: "replayed · 原初始化收据",
+            cf_replayed_ready_badge: "replayed · 无新写入",
+            cf_replayed_recovered_badge: "replayed · 凭据已恢复",
             cf_conflict: "冲突 · submission_replay_conflict",
             cf_error: "提交被拒绝",
             cf_sub_committed: "工作区初始化已提交。以下是初始化收据与第一步状态（不是最终报告、交付页或实时进度）：",
@@ -260,7 +262,9 @@
             preview_formats: "Local output: ",
             cf_committed: "Committed",
             cf_replayed: "Replayed",
-            cf_replayed_badge: "replayed · no new writes",
+            cf_replayed_receipt_badge: "replayed · original receipt",
+            cf_replayed_ready_badge: "replayed · no new writes",
+            cf_replayed_recovered_badge: "replayed · credential recovered",
             cf_conflict: "submission_replay_conflict",
             cf_error: "Submission rejected",
             cf_sub_committed: "Workspace initialization committed. This is the initialization receipt and first action only, not the final report, delivery page, or live progress:",
@@ -1724,7 +1728,14 @@
         status.id = "cf-title";
         status.appendChild(el("span", "cf-icon", "✓"));
         status.appendChild(el("span", null, t(replayed ? "cf_replayed" : "cf_committed")));
-        if (replayed) status.appendChild(el("span", "cf-badge-replay", t("cf_replayed_badge")));
+        if (replayed) {
+            var replayBadgeKey = response.search_secret_status === "recovered"
+                ? "cf_replayed_recovered_badge"
+                : response.search_secret_status === "ready"
+                    ? "cf_replayed_ready_badge"
+                    : "cf_replayed_receipt_badge";
+            status.appendChild(el("span", "cf-badge-replay", t(replayBadgeKey)));
+        }
         cfBody.appendChild(status);
         cfBody.appendChild(el("p", "cf-sub", t(replayed ? "cf_sub_replayed" : "cf_sub_committed")));
 
