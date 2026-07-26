@@ -300,7 +300,9 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
         import urllib.request
 
         import multi_agent_brief
+        import multi_agent_brief.runtime_host_v2.service as runtime_host_service
         from multi_agent_brief.control_store import SQLiteControlStore
+        from multi_agent_brief.core_run_v2.errors import CoreRunError
         from multi_agent_brief.product.init_web.server import _verify_assets
         from multi_agent_brief.product.init_web.submit import InitWebSubmitter
         from multi_agent_brief.runtime_host_v2.codex import (
@@ -449,6 +451,67 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
             "version: 1\\ncandidates:\\n  - route: web-search\\n",
             encoding="utf-8",
         )
+        preflight_reason = None
+        if sys.platform != "win32":
+            envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+            accepted = service.accept_invocation(envelope["invocation_id"])
+            assert accepted.status == "committed"
+            source_action = service.next_action()
+            assert source_action.effect_kind == "source_acquire"
+            with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+                head = store.load_workspace_run_head()
+                assert head is not None
+                stopped_snapshot = store.load_snapshot(head.current_run_id)
+
+            original_capability_profile = runtime_host_service.capability_profile
+            original_known_env_key_is_set = (
+                runtime_host_service.known_env_key_is_set
+            )
+            preflight_calls = 0
+            network_calls = 0
+
+            def unsupported_capability(path):
+                global preflight_calls
+                preflight_calls += 1
+                assert path == workspace
+                raise CoreRunError("checkout_publication_unsupported")
+
+            def forbidden_credential(*_args, **_kwargs):
+                raise AssertionError("credential read crossed capability stop")
+
+            def forbidden_network(*_args, **_kwargs):
+                global network_calls
+                network_calls += 1
+                raise AssertionError("network call crossed capability stop")
+
+            runtime_host_service.capability_profile = unsupported_capability
+            runtime_host_service.known_env_key_is_set = forbidden_credential
+            urllib.request.urlopen = forbidden_network
+            try:
+                for _ in range(2):
+                    stopped = service.continue_authorized()
+                    assert stopped.status == "needs_attention"
+                    assert (
+                        stopped.reason_code
+                        == "checkout_publication_unsupported"
+                    )
+                    assert service.next_action() == source_action
+            finally:
+                runtime_host_service.capability_profile = (
+                    original_capability_profile
+                )
+                runtime_host_service.known_env_key_is_set = (
+                    original_known_env_key_is_set
+                )
+                urllib.request.urlopen = search_call
+            assert preflight_calls == 2
+            assert network_calls == 0
+            assert calls == 0
+            with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+                head = store.load_workspace_run_head()
+                assert head is not None
+                assert store.load_snapshot(head.current_run_id) == stopped_snapshot
+            preflight_reason = "checkout_publication_unsupported"
         continued = service.continue_authorized()
         if sys.platform == "win32":
             assert continued.status == "needs_attention"
@@ -505,6 +568,7 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
             )
             result = {
                 "platform_boundary": None,
+                "source_acquire_preflight": preflight_reason,
                 "provider_calls": calls,
                 "sources": [
                     {
