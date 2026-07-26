@@ -7,11 +7,23 @@ import pytest
 from tests import test_core_run_v2 as core_fixture
 from tests import test_core_run_v2_gate_repair as gate_repair_fixture
 from tests import test_core_run_v2_recovery as recovery_fixture
+from tests.test_runtime_host_continue_v2 import (
+    _advance_discovery_to_source_action,
+    _discovery_workspace,
+    _service,
+    _tavily_item,
+)
 
 from multi_agent_brief.control_store import SQLiteControlStore
 from multi_agent_brief.core_run_v2.errors import CoreRunError
 from multi_agent_brief.core_run_v2.next_action import classify_core_run_next_action
 from multi_agent_brief.core_run_v2.verifier import CoreRunDomainVerifier
+from multi_agent_brief.intake_v2.service import IntakeService
+from multi_agent_brief.runtime_host_v2.errors import RuntimeHostError
+from multi_agent_brief.runtime_host_v2.initialization import (
+    initialize_or_open_runtime,
+)
+from multi_agent_brief.sources.web_search import WebSearchProvider
 
 
 def _verified(workspace, run_id):
@@ -41,6 +53,60 @@ def test_next_action_delegation_and_active_invocation_precedence(tmp_path) -> No
     assert reserved.action_kind == "deterministic"
     assert reserved.effect_kind == "invocation_accept_or_fail"
     assert reserved.stage_id == "scout"
+
+
+def test_next_action_recovers_only_exact_discovery_reservation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    action = _advance_discovery_to_source_action(workspace)
+    monkeypatch.setattr(
+        WebSearchProvider,
+        "collect",
+        lambda *_args, **_kwargs: [_tavily_item(durable=True)],
+    )
+
+    def crash_before_promotion(*_args, **_kwargs):
+        raise RuntimeHostError("simulated_post_invocation_crash")
+
+    monkeypatch.setattr(
+        IntakeService,
+        "_commit_discovery_source_pack_from_core",
+        crash_before_promotion,
+    )
+
+    with pytest.raises(RuntimeHostError, match="simulated_post_invocation_crash"):
+        _service(workspace).apply_current(action)
+
+    recovered = classify_core_run_next_action(_verified(workspace, action.run_id))
+    assert recovered.action_kind == "deterministic"
+    assert recovered.effect_kind == "source_acquire"
+    assert (
+        recovered.reason_code
+        == "active_discovery_source_acquire_requires_resume"
+    )
+
+
+def test_next_action_keeps_arbitrary_discovery_invocation_reserved(tmp_path) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    action = _advance_discovery_to_source_action(workspace)
+    service = _service(workspace)
+    current = initialize_or_open_runtime(
+        workspace,
+        adapter_loader=service._adapter_loader,
+    )
+    service._start_invocation_for_action(
+        current,
+        action,
+        role_id="source-provider",
+        request_id="REQ-ARBITRARY-DISCOVERY-INVOCATION",
+    )
+
+    reserved = classify_core_run_next_action(_verified(workspace, action.run_id))
+    assert reserved.action_kind == "deterministic"
+    assert reserved.effect_kind == "invocation_accept_or_fail"
+    assert reserved.reason_code == "active_invocation_reserved"
 
 
 def test_next_action_selects_stage_complete_after_current_proposals(tmp_path) -> None:

@@ -14,7 +14,10 @@ from multi_agent_brief.audience_memory import (
 from multi_agent_brief.workspace.init_profile import InitProfile
 
 if TYPE_CHECKING:
-    from multi_agent_brief.contracts.v2 import RunExecutionAuthorizationBootstrap
+    from multi_agent_brief.contracts.v2 import (
+        RunExecutionAuthorizationBootstrap,
+        RunSourceDiscoveryAuthorizationBootstrap,
+    )
 
 try:
     from dotenv import load_dotenv
@@ -422,6 +425,9 @@ def create_workspace(
     report_date_factory: Callable[[], date] = date.today,
     identity_factory: Callable[[], str] = _new_controlstore_identity,
     execution_authorization: RunExecutionAuthorizationBootstrap | None = None,
+    source_discovery_authorization: (
+        RunSourceDiscoveryAuthorizationBootstrap | None
+    ) = None,
     post_finalize_html: bool = False,
 ) -> None:
     from multi_agent_brief.product.workspace_hygiene import (
@@ -452,6 +458,20 @@ def create_workspace(
         report_date=report_date_factory(),
         execution_authorization=execution_authorization,
     )
+    if source_discovery_authorization is not None:
+        from multi_agent_brief.contracts.v2 import WorkspaceControlStoreBootstrapV2
+
+        bootstrap = WorkspaceControlStoreBootstrapV2.model_validate(
+            {
+                **bootstrap.model_dump(mode="json", exclude_unset=False),
+                "source_discovery_authorization": (
+                    source_discovery_authorization.model_dump(
+                        mode="json", exclude_unset=False
+                    )
+                ),
+            },
+            strict=True,
+        )
     lang = profile.interface_language
     files = {
         target / "config.yaml": to_yaml(
