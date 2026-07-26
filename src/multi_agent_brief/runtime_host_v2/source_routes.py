@@ -132,7 +132,7 @@ def collect_frozen_sources(
     else:  # pragma: no cover - discriminated strict contract is total
         raise RuntimeHostError("runtime_source_plan_invalid")
     if not items:
-        raise RuntimeHostError("runtime_source_acquisition_failed")
+        raise RuntimeHostError("source_pack_empty")
     items = _canonical_source_items(items)
     ordered = sorted(
         items,
@@ -254,6 +254,15 @@ def _material_from_item(
         if not item.url:
             raise RuntimeHostError("runtime_source_acquisition_failed")
         locator = {"kind": "web", "url": item.url}
+    has_durable_tavily_content = (
+        route.provider_id == "tavily"
+        and item.source_type == "web_search"
+        and item.metadata.get("backend") == "tavily"
+        and item.metadata.get("content_shape") == "provider_raw_content"
+        and item.metadata.get("has_raw_content") is True
+        and item.metadata.get("evidence_quality") == "partial_extract"
+        and bool(item.content.strip())
+    )
     proposal = SourceProposal.model_validate(
         {
             "schema_version": SourceProposal.schema_id,
@@ -264,21 +273,21 @@ def _material_from_item(
                 "cached_provider_response"
                 if is_cached
                 else "provider_response"
-                if is_newsapi
+                if is_newsapi or has_durable_tavily_content
                 else "search_snippet_only"
             ),
             "acquisition_method": (
                 "cached_provider_response"
                 if is_cached
                 else "provider_extract"
-                if is_newsapi
+                if is_newsapi or has_durable_tavily_content
                 else "provider_search"
             ),
             "material_kind": (
                 "full_content"
                 if is_cached
                 else "partial_extract"
-                if is_newsapi
+                if is_newsapi or has_durable_tavily_content
                 else "search_snippet"
             ),
             "provider": route.provider_id or "cached_package",

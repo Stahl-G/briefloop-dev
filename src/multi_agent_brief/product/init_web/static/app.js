@@ -151,6 +151,7 @@
             cf_again: "再次提交同一请求（replay）",
             cf_close: "关闭，修改后重试",
             cf_note: "目标为 finalized_local，预授权编辑修复预算为 1。此页仅确认初始化；已启动的 Codex 控制器会在命令行继续。",
+            cf_note_discovery: "已记录 Tavily 自动来源发现授权；当前控制器将继续检索、冻结来源并推进工作流。本页不表示执行授权已完成，也不表示报告、门禁、审批或交付已经完成。",
             cf_note_manual: "本次初始化没有 RunExecutionAuthorization；后续为手动继续，不声明 finalized_local 或修复预算。"
         },
         en: {
@@ -268,6 +269,7 @@
             cf_again: "Resubmit the same request (replay)",
             cf_close: "Close, change something, retry",
             cf_note: "The target is finalized_local with one preauthorized editor repair. This page confirms initialization only; the initiating Codex controller continues in the terminal.",
+            cf_note_discovery: "Tavily source-discovery authority is recorded. The current controller continues retrieval, source freezing, and the workflow. This page does not claim completed execution authorization, report, gates, approval, or delivery.",
             cf_note_manual: "This initialization has no RunExecutionAuthorization; continuation is manual and does not claim finalized_local or a repair budget."
         }
     };
@@ -1724,7 +1726,10 @@
         var receiptRows = [["workspace_id", response.workspace_id],
          ["run_id", response.run_id],
          ["transaction_id", response.transaction_id]];
-        if (response.execution_authorized === true) {
+        if (
+            response.execution_authorized === true
+            || response.source_discovery_authorized === true
+        ) {
             receiptRows.push(["completion_target", response.completion_target]);
             receiptRows.push(["repair_budget", response.repair_budget]);
         }
@@ -1739,8 +1744,7 @@
         var next = el("p", "cf-next");
         next.appendChild(el("span", null, t("cf_next")));
         var firstAction = response.first_action || {};
-        var discovery = response.source_discovery || {};
-        var continuationLabel = discovery.backend === "tavily"
+        var continuationLabel = response.source_discovery_authorized === true
             ? "Tavily automatic discovery · "
             : "manual continuation · ";
         next.appendChild(el("code", null,
@@ -1765,7 +1769,15 @@
         cfBody.appendChild(el(
             "p",
             "cf-note",
-            t(response.execution_authorized === true ? "cf_note" : "cf_note_manual")
+            t(
+                response.execution_authorized === true
+                    ? "cf_note"
+                    : (
+                        response.source_discovery_authorized === true
+                            ? "cf_note_discovery"
+                            : "cf_note_manual"
+                    )
+            )
         ));
     }
 

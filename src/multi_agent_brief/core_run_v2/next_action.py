@@ -479,6 +479,30 @@ def _source_discovery_action(verified: VerifiedCoreRun) -> CoreRunNextAction:
         )
         not in verified.exhausted_source_route_keys
     ]
+    if snapshot.run_source_discovery_authorizations:
+        if len(snapshot.run_source_discovery_authorizations) != 1:
+            raise CoreRunError("control_store_integrity_invalid")
+        discovery = snapshot.run_source_discovery_authorizations[0]
+        authorized_routes = [
+            item
+            for item in verified.source_plan.routes
+            if item.route_id == discovery.source_route_id
+            and item.provider_id == discovery.provider_id
+            and item.execution_owner == discovery.execution_owner
+            and item.route_fingerprint == discovery.route_fingerprint
+        ]
+        if len(authorized_routes) != 1:
+            raise CoreRunError("control_store_integrity_invalid")
+        routes = [
+            item
+            for item in routes
+            if item.route_id == discovery.source_route_id
+            and item.provider_id == discovery.provider_id
+            and item.execution_owner == discovery.execution_owner
+            and item.route_fingerprint == discovery.route_fingerprint
+        ]
+        if len(routes) > 1:
+            raise CoreRunError("control_store_integrity_invalid")
     if not routes:
         return _action(
             verified,

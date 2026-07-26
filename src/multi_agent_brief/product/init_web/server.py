@@ -74,6 +74,7 @@ class InitWebSubmissionOutcome:
     transaction_id: str
     status: str
     execution_authorized: bool
+    source_discovery_authorized: bool
 
 
 @dataclass
@@ -150,6 +151,9 @@ def create_init_web_server(
             "run_id": response.get("run_id"),
             "transaction_id": response.get("transaction_id"),
             "execution_authorized": response.get("execution_authorized") is True,
+            "source_discovery_authorized": (
+                response.get("source_discovery_authorized") is True
+            ),
             "first_action": {
                 "action_kind": action_payload.get("action_kind"),
                 "effect_kind": action_payload.get("effect_kind"),
@@ -164,7 +168,10 @@ def create_init_web_server(
                 "reason_code": progress_payload.get("reason_code"),
             },
         }
-        if response.get("execution_authorized") is True:
+        if (
+            response.get("execution_authorized") is True
+            or response.get("source_discovery_authorized") is True
+        ):
             friendly["completion_target"] = response.get("completion_target")
             friendly["repair_budget"] = response.get("repair_budget")
         source_discovery = response.get("source_discovery")
@@ -355,6 +362,9 @@ def create_init_web_server(
                     status=str(response.get("status")),
                     execution_authorized=(
                         response.get("execution_authorized") is True
+                    ),
+                    source_discovery_authorized=(
+                        response.get("source_discovery_authorized") is True
                     ),
                 )
                 with outcome_lock:
