@@ -815,6 +815,97 @@ def test_discovery_precommit_crash_reuses_staged_bytes_before_secret_or_provider
     assert len(snapshot.run_execution_authorizations) == 1
 
 
+def test_discovery_source_acquire_platform_stop_preserves_verified_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    provider_calls = 0
+
+    def collect(_provider, _query, _config):
+        nonlocal provider_calls
+        provider_calls += 1
+        return [_tavily_item(durable=True)]
+
+    monkeypatch.setattr(WebSearchProvider, "collect", collect)
+    action = _advance_discovery_to_source_action(workspace)
+    stage_identity = _discovery_stage_identity(workspace, action)
+    interrupted = _service(workspace)
+
+    def crash_after_stage(*_args, **_kwargs):
+        raise RuntimeHostError("simulated_precommit_crash")
+
+    monkeypatch.setattr(
+        interrupted,
+        "_start_invocation_for_action",
+        crash_after_stage,
+    )
+    with pytest.raises(RuntimeHostError, match="simulated_precommit_crash"):
+        interrupted.apply_current(action)
+    assert provider_calls == 1
+
+    stage_root = source_stage_root(workspace, stage_identity)
+    stage_before = {
+        path.relative_to(stage_root).as_posix(): path.read_bytes()
+        for path in stage_root.rglob("*")
+        if path.is_file()
+    }
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot_before = store.load_snapshot(head.current_run_id)
+
+    capability_checks = 0
+
+    def unsupported_capability(path: Path):
+        nonlocal capability_checks
+        capability_checks += 1
+        assert path == workspace
+        raise CoreRunError("checkout_publication_unsupported")
+
+    def forbidden_credential_read(*_args, **_kwargs):
+        pytest.fail("credential must not be inspected after capability stop")
+
+    def forbidden_provider(*_args, **_kwargs):
+        pytest.fail("provider must not be called after capability stop")
+
+    def forbidden_network(*_args, **_kwargs):
+        pytest.fail("network must not be called after capability stop")
+
+    monkeypatch.setattr(
+        "multi_agent_brief.runtime_host_v2.service.capability_profile",
+        unsupported_capability,
+    )
+    monkeypatch.setattr(
+        "multi_agent_brief.runtime_host_v2.service.known_env_key_is_set",
+        forbidden_credential_read,
+    )
+    monkeypatch.setattr(WebSearchProvider, "collect", forbidden_provider)
+    monkeypatch.setattr(
+        "multi_agent_brief.sources.search_backends.tavily.urllib.request.urlopen",
+        forbidden_network,
+    )
+
+    for _ in range(2):
+        stopped = _service(workspace).continue_authorized()
+        assert stopped.status == "needs_attention"
+        assert stopped.reason_code == "checkout_publication_unsupported"
+        assert _service(workspace).next_action() == action
+
+    assert capability_checks == 2
+    assert "TAVILY_API_KEY" not in os.environ
+    assert {
+        path.relative_to(stage_root).as_posix(): path.read_bytes()
+        for path in stage_root.rglob("*")
+        if path.is_file()
+    } == stage_before
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot_after = store.load_snapshot(head.current_run_id)
+    assert snapshot_after == snapshot_before
+
+
 def test_discovery_active_invocation_reuses_receipt_owned_stage_without_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
