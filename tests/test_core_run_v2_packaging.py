@@ -383,6 +383,13 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
         assert response["source_discovery_authorized"] is True
         assert response["search_secret_status"] == "ready"
         workspace = base / "workspace"
+        assert (workspace / ".env").is_file()
+        with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+            head = store.load_workspace_run_head()
+            assert head is not None
+            initialized = store.load_snapshot(head.current_run_id)
+        assert len(initialized.run_source_discovery_authorizations) == 1
+        assert initialized.run_execution_authorizations == ()
         calls = 0
 
         class SearchResponse:
@@ -448,6 +455,34 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
             assert continued.reason_code == "checkout_publication_unsupported"
             assert calls == 0
             assert "TAVILY_API_KEY" not in os.environ
+            with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+                head = store.load_workspace_run_head()
+                assert head is not None
+                snapshot = store.load_snapshot(head.current_run_id)
+            stopped_revision = snapshot.store_revision
+            assert len(snapshot.run_source_discovery_authorizations) == 1
+            assert snapshot.sources == ()
+            assert snapshot.run_execution_authorizations == ()
+            assert not {
+                "run_execution_source_manifest",
+                "input_classification",
+            }.intersection(item.artifact_id for item in snapshot.artifacts)
+            assert snapshot.finalize_renders == ()
+            assert snapshot.finalizations == ()
+            assert snapshot.approvals == ()
+            assert snapshot.package_ready_records == ()
+            assert snapshot.delivery_authorizations == ()
+            assert snapshot.delivery_attempts == ()
+            assert snapshot.delivery_results == ()
+            retried = service.continue_authorized()
+            assert retried.status == "needs_attention"
+            assert retried.reason_code == "checkout_publication_unsupported"
+            assert calls == 0
+            with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+                head = store.load_workspace_run_head()
+                assert head is not None
+                retry_snapshot = store.load_snapshot(head.current_run_id)
+            assert retry_snapshot.store_revision == stopped_revision
             result = {
                 "platform_boundary": continued.reason_code,
                 "provider_calls": calls,
