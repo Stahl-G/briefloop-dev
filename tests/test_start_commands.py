@@ -52,6 +52,7 @@ def test_init_web_handoff_prints_exact_browser_selected_target(
             run_id="RUN-SELECTED",
             transaction_id="TX-SELECTED",
             execution_authorized=True,
+            source_discovery_authorized=False,
         )
     )
     monkeypatch.setattr(
@@ -68,7 +69,7 @@ def test_init_web_handoff_prints_exact_browser_selected_target(
     assert server.closed is True
 
 
-def test_init_web_public_search_handoff_uses_standard_codex_run(
+def test_init_web_discovery_authorized_handoff_uses_runtime_continue(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     selected = tmp_path / "public-search"
@@ -79,6 +80,34 @@ def test_init_web_public_search_handoff_uses_standard_codex_run(
             run_id="RUN-PUBLIC",
             transaction_id="TX-PUBLIC",
             execution_authorized=False,
+            source_discovery_authorized=True,
+        )
+    )
+    monkeypatch.setattr(
+        "multi_agent_brief.product.init_web.create_init_web_server",
+        lambda *_args, **_kwargs: server,
+    )
+    monkeypatch.setattr("webbrowser.open", lambda _url: True)
+
+    assert _init_web_wizard(SimpleNamespace(port=0)) == 0
+
+    output = capsys.readouterr().out
+    assert f"briefloop runtime continue --workspace {selected}" in output
+    assert "--skip-doctor" not in output
+
+
+def test_init_web_manual_handoff_retains_standard_codex_run(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    selected = tmp_path / "manual"
+    server = _InitWebServerDouble(
+        outcome=SimpleNamespace(
+            status="committed",
+            workspace=str(selected),
+            run_id="RUN-MANUAL",
+            transaction_id="TX-MANUAL",
+            execution_authorized=False,
+            source_discovery_authorized=False,
         )
     )
     monkeypatch.setattr(
@@ -95,6 +124,33 @@ def test_init_web_public_search_handoff_uses_standard_codex_run(
         in output
     )
     assert "runtime continue" not in output
+
+
+def test_init_web_both_authorities_handoff_uses_runtime_continue(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    selected = tmp_path / "promoted"
+    server = _InitWebServerDouble(
+        outcome=SimpleNamespace(
+            status="replayed",
+            workspace=str(selected),
+            run_id="RUN-PROMOTED",
+            transaction_id="TX-PROMOTED",
+            execution_authorized=True,
+            source_discovery_authorized=True,
+        )
+    )
+    monkeypatch.setattr(
+        "multi_agent_brief.product.init_web.create_init_web_server",
+        lambda *_args, **_kwargs: server,
+    )
+    monkeypatch.setattr("webbrowser.open", lambda _url: True)
+
+    assert _init_web_wizard(SimpleNamespace(port=0)) == 0
+
+    output = capsys.readouterr().out
+    assert f"briefloop runtime continue --workspace {selected}" in output
+    assert "--skip-doctor" not in output
 
 
 @pytest.mark.parametrize(

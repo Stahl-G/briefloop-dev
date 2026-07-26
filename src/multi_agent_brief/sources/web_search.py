@@ -249,6 +249,15 @@ class WebSearchProvider(SourceProvider):
             "source_temporality": result.metadata.get("source_temporality", "retrieved_only"),
         }
         metadata.update(result.metadata)
+        raw_content = (
+            result.raw_content.strip()
+            if isinstance(result.raw_content, str) and result.raw_content.strip()
+            else None
+        )
+        metadata["content_shape"] = (
+            "provider_raw_content" if raw_content is not None else "search_snippet"
+        )
+        metadata["has_raw_content"] = raw_content is not None
         # Propagate task metadata (topic, market, language, etc.) to SourceItem
         if task_metadata:
             for key, value in task_metadata.items():
@@ -258,7 +267,7 @@ class WebSearchProvider(SourceProvider):
             source_name=result.source_name or "web_search",
             source_type="web_search",
             title=result.title,
-            content=result.snippet,
+            content=raw_content if raw_content is not None else result.snippet,
             url=result.url,
             published_at=result.published_at,
             retrieved_at=retrieved_at,
