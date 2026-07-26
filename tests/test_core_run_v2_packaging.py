@@ -257,6 +257,279 @@ def test_finalized_local_review_projection_source_and_wheel_parity(
     assert json.loads(run.stdout) == source_payload
 
 
+def test_tavily_discovery_promotion_source_and_wheel_parity(
+    tmp_path: Path,
+) -> None:
+    build_root = tmp_path / "build-root"
+    build_root.mkdir()
+    shutil.copy2(ROOT / "pyproject.toml", build_root / "pyproject.toml")
+    shutil.copy2(ROOT / "README.md", build_root / "README.md")
+    shutil.copytree(ROOT / "src", build_root / "src")
+    wheel_dir = tmp_path / "wheel"
+    wheel_dir.mkdir()
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            ".",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(wheel_dir),
+        ],
+        cwd=build_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheel_path = next(wheel_dir.glob("briefloop-*.whl"))
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    with zipfile.ZipFile(wheel_path) as archive:
+        archive.extractall(installed)
+
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        import sys
+        import urllib.request
+
+        import multi_agent_brief
+        from multi_agent_brief.control_store import SQLiteControlStore
+        from multi_agent_brief.product.init_web.server import _verify_assets
+        from multi_agent_brief.product.init_web.submit import InitWebSubmitter
+        from multi_agent_brief.runtime_host_v2.codex import (
+            workspace_codex_adapter_loader,
+        )
+        from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
+        from multi_agent_brief.sources.base import SourceItem
+        from multi_agent_brief.sources.search_backends.base import SearchBackendError
+        from multi_agent_brief.sources.search_backends.tavily import TavilyBackend
+        from multi_agent_brief.sources.web_search import WebSearchProvider
+
+        base = Path(sys.argv[1])
+        expected_package_root = Path(sys.argv[2]).resolve()
+        package_root = Path(multi_agent_brief.__file__).resolve()
+        assert package_root.is_relative_to(expected_package_root)
+        _verify_assets()
+        sentinel = "tvly-wheel-secret-must-not-escape"
+        prior_key = os.environ.get("TAVILY_API_KEY")
+        original_urlopen = urllib.request.urlopen
+        os.environ["TAVILY_API_KEY"] = "test-only-tavily-key"
+
+        def fail_transport(_request, timeout=30):
+            raise RuntimeError(sentinel)
+
+        urllib.request.urlopen = fail_transport
+        try:
+            TavilyBackend().search("test query")
+        except SearchBackendError as exc:
+            assert str(exc) == "Tavily search failed"
+            assert exc.backend == "tavily"
+            assert exc.__cause__ is None
+            assert exc.__context__ is None
+            assert sentinel not in repr(exc)
+        else:
+            raise AssertionError("transport failure must remain typed")
+        finally:
+            urllib.request.urlopen = original_urlopen
+            if prior_key is None:
+                os.environ.pop("TAVILY_API_KEY", None)
+            else:
+                os.environ["TAVILY_API_KEY"] = prior_key
+
+        submitter = InitWebSubmitter(base_dir=base)
+        configured = submitter.configure_search_secret(
+            session_id="wheel-discovery-session",
+            body={
+                "provider": "tavily",
+                "api_key": "tvly-wheel-secret-sentinel",
+            },
+        )
+        assert configured["configured"] is True
+        body = {
+            "schema_version": "briefloop.init_web.submission.v1",
+            "request_id": "REQ-WHEEL-DISCOVERY",
+            "payload": {
+                "workspace_target": "workspace",
+                "selections": {
+                    "company": "ExampleCo",
+                    "industry_or_theme": "manufacturing",
+                    "task_objective": "Prepare a public-safe brief.",
+                    "brief_title": "ExampleCo brief",
+                    "audience": "management",
+                    "interface_language": "en",
+                    "output_language": "en",
+                    "cadence": "weekly",
+                    "focus_areas": ["operations"],
+                    "output_formats": ["markdown"],
+                    "forbidden_sources": [],
+                    "source_profile": "llm_decide",
+                    "web_search_mode": "external_api",
+                    "search_backend": "tavily",
+                    "output_extent": "balanced",
+                },
+                "search_secret_session_id": "wheel-discovery-session",
+                "human_confirmation": True,
+            },
+        }
+        status, response = submitter.submit(body)
+        assert status == 200
+        assert response["execution_authorized"] is False
+        assert response["source_discovery_authorized"] is True
+        workspace = base / "workspace"
+        calls = 0
+
+        def collect(_provider, _query, _config):
+            global calls
+            calls += 1
+            return [
+                SourceItem(
+                    source_id="durable",
+                    source_name="Example publisher",
+                    source_type="web_search",
+                    title="Durable result",
+                    content="durable provider content",
+                    url="https://example.com/durable",
+                    retrieved_at="2026-07-26T00:00:00Z",
+                    metadata={
+                        "backend": "tavily",
+                        "content_shape": "provider_raw_content",
+                        "has_raw_content": True,
+                        "evidence_quality": "partial_extract",
+                    },
+                ),
+                SourceItem(
+                    source_id="snippet",
+                    source_name="Example publisher",
+                    source_type="web_search",
+                    title="Snippet result",
+                    content="search snippet only",
+                    url="https://example.com/snippet",
+                    retrieved_at="2026-07-26T00:00:00Z",
+                    metadata={
+                        "backend": "tavily",
+                        "content_shape": "search_snippet",
+                        "has_raw_content": False,
+                        "evidence_quality": "snippet",
+                    },
+                ),
+            ]
+
+        WebSearchProvider.collect = collect
+        service = RuntimeHostService(
+            workspace,
+            adapter_loader=workspace_codex_adapter_loader(workspace),
+        )
+        planner = service.continue_authorized()
+        assert planner.status == "role_work_required"
+        envelope_path = workspace / planner.trace.envelope_path
+        (envelope_path.parent / "source_candidates.yaml").write_text(
+            "version: 1\\ncandidates:\\n  - route: web-search\\n",
+            encoding="utf-8",
+        )
+        continued = service.continue_authorized()
+        if sys.platform == "win32":
+            assert continued.status == "needs_attention"
+            assert continued.reason_code == "checkout_publication_unsupported"
+            assert calls == 0
+            result = {
+                "platform_boundary": continued.reason_code,
+                "provider_calls": calls,
+                "source_count": 0,
+                "execution_authorized": False,
+            }
+        else:
+            assert continued.status == "role_work_required"
+            assert calls == 1
+            with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+                head = store.load_workspace_run_head()
+                assert head is not None
+                snapshot = store.load_snapshot(head.current_run_id)
+                history = store.load_history()
+            promotion = next(
+                item
+                for item in history.transactions
+                if item.transaction_type == "source_evidence_intake"
+            )
+            result = {
+                "platform_boundary": None,
+                "provider_calls": calls,
+                "sources": [
+                    {
+                        "origin_type": item.origin_type,
+                        "acquisition_method": item.acquisition_method,
+                        "material_kind": item.material_kind,
+                        "content_sha256": item.content_sha256,
+                        "claims_eligible": item.claims_eligible,
+                        "eligibility_reason": item.eligibility_reason,
+                    }
+                    for item in snapshot.sources
+                ],
+                "execution_authorization": (
+                    {
+                        key: value
+                        for key, value in (
+                            snapshot.run_execution_authorizations[0].model_dump(
+                                mode="json", exclude_unset=False
+                            )
+                        ).items()
+                        if key != "created_at"
+                    }
+                ),
+                "promotion": {
+                    "transaction_type": promotion.transaction_type,
+                    "source_count": len(promotion.source_ids),
+                    "artifact_revisions": sorted(
+                        (
+                            item.artifact_id,
+                            item.revision,
+                        )
+                        for item in promotion.artifact_revisions
+                    ),
+                    "discovery_authorization_count": len(
+                        promotion.run_source_discovery_authorizations
+                    ),
+                    "execution_authorization_count": len(
+                        promotion.run_execution_authorizations
+                    ),
+                },
+                "next_effect": continued.trace.next_action.effect_kind,
+            }
+            assert b"tvly-wheel-secret-sentinel" not in (
+                workspace / "briefloop.db"
+            ).read_bytes()
+        print(json.dumps(result, sort_keys=True))
+        """
+    )
+    script_path = tmp_path / "wheel_tavily_discovery.py"
+    script_path.write_bytes(script.encode("utf-8"))
+
+    def run_with(path: Path, base: Path) -> dict[str, object]:
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(path)
+        run = subprocess.run(
+            [sys.executable, str(script_path), str(base), str(path)],
+            cwd=tmp_path,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert run.returncode == 0, run.stdout + run.stderr
+        return json.loads(run.stdout)
+
+    source_payload = run_with(ROOT / "src", tmp_path / "source")
+    wheel_payload = run_with(installed, tmp_path / "wheel-run")
+
+    assert wheel_payload == source_payload
+
+
 def test_non_editable_wheel_runs_complete_dormant_core_spine(
     tmp_path: Path,
 ) -> None:
@@ -384,6 +657,11 @@ def test_non_editable_wheel_runs_complete_dormant_core_spine(
         ).joinpath("migrations", "0008.sql")
         assert migration_0008.is_file()
         assert "PRAGMA user_version=8;" in migration_0008.read_text(encoding="utf-8")
+        migration_0009 = resources.files(
+            "multi_agent_brief.control_store"
+        ).joinpath("migrations", "0009.sql")
+        assert migration_0009.is_file()
+        assert "PRAGMA user_version=9;" in migration_0009.read_text(encoding="utf-8")
         assert callable(build_checkout_revision)
         assert CheckoutPublicationEngine.__module__.endswith(".publication")
         assert MAX_SOURCE_PACK_MEMBERS == 256

@@ -28,7 +28,10 @@ from multi_agent_brief.runtime_host_v2.projections import (
     build_store_status_projection,
 )
 from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
+from multi_agent_brief.runtime_host_v2.source_routes import collect_frozen_sources
 from multi_agent_brief.runtime_host_v2.scratch import materialize_host_bytes
+from multi_agent_brief.sources.base import SourceItem, SourceQuery
+from multi_agent_brief.intake_v2.policy import evaluate_source_eligibility
 from multi_agent_brief.workspace.init_profile import InitProfile
 
 
@@ -239,6 +242,123 @@ def test_external_source_plan_freezes_executable_non_secret_requests(
     )
     assert reopened.verified.source_plan.source_plan_fingerprint == fingerprint
     assert reopened_route.acquisition_spec == spec
+
+
+def test_tavily_route_maps_only_verified_raw_content_to_eligible_extract(
+    tmp_path: Path,
+) -> None:
+    workspace = _external_web_workspace(tmp_path)
+    initialized = initialize_or_open_runtime(workspace, adapter_loader=_adapter)
+    route = next(
+        item
+        for item in initialized.verified.source_plan.routes
+        if item.route_id == "web-search"
+    )
+
+    class _Provider:
+        def collect(self, _query: SourceQuery, _config: dict) -> list[SourceItem]:
+            return [
+                SourceItem(
+                    source_id="DURABLE",
+                    source_name="example.com",
+                    source_type="web_search",
+                    title="Durable",
+                    content="retrieved durable page extract",
+                    url="https://example.com/durable",
+                    metadata={
+                        "backend": "tavily",
+                        "content_shape": "provider_raw_content",
+                        "has_raw_content": True,
+                        "evidence_quality": "partial_extract",
+                    },
+                ),
+                SourceItem(
+                    source_id="SNIPPET",
+                    source_name="example.com",
+                    source_type="web_search",
+                    title="Snippet",
+                    content="search snippet",
+                    url="https://example.com/snippet",
+                    metadata={
+                        "backend": "tavily",
+                        "content_shape": "search_snippet",
+                        "has_raw_content": False,
+                        "evidence_quality": "snippet",
+                    },
+                ),
+            ]
+
+    materials = collect_frozen_sources(
+        workspace,
+        run_id=initialized.verified.snapshot.run.run_id,
+        invocation_id="INV-DURABLE-CONTENT",
+        route=route,
+        provider_factory=lambda _kind: _Provider(),
+    )
+
+    by_title = {item.proposal.title: item for item in materials}
+    durable = by_title["Durable"]
+    assert durable.content == b"retrieved durable page extract"
+    assert durable.proposal.origin_type == "provider_response"
+    assert durable.proposal.acquisition_method == "provider_extract"
+    assert durable.proposal.material_kind == "partial_extract"
+    assert evaluate_source_eligibility(
+        durable.proposal,
+        raw_payload_present=True,
+    ) == (True, "eligible_durable_source_content")
+    snippet = by_title["Snippet"]
+    assert snippet.proposal.origin_type == "search_snippet_only"
+    assert snippet.proposal.acquisition_method == "provider_search"
+    assert snippet.proposal.material_kind == "search_snippet"
+    assert evaluate_source_eligibility(
+        snippet.proposal,
+        raw_payload_present=True,
+    ) == (False, "ineligible_search_snippet")
+
+
+def test_tavily_route_does_not_trust_raw_content_marker_alone(
+    tmp_path: Path,
+) -> None:
+    workspace = _external_web_workspace(tmp_path)
+    initialized = initialize_or_open_runtime(workspace, adapter_loader=_adapter)
+    route = next(
+        item
+        for item in initialized.verified.source_plan.routes
+        if item.route_id == "web-search"
+    )
+
+    class _Provider:
+        def collect(self, _query: SourceQuery, _config: dict) -> list[SourceItem]:
+            return [
+                SourceItem(
+                    source_id="FORGED",
+                    source_name="example.com",
+                    source_type="web_search",
+                    title="Forged marker",
+                    content="search snippet",
+                    url="https://example.com/forged",
+                    metadata={
+                        "backend": "other",
+                        "content_shape": "provider_raw_content",
+                        "has_raw_content": True,
+                        "evidence_quality": "partial_extract",
+                    },
+                )
+            ]
+
+    material = collect_frozen_sources(
+        workspace,
+        run_id=initialized.verified.snapshot.run.run_id,
+        invocation_id="INV-FORGED-CONTENT",
+        route=route,
+        provider_factory=lambda _kind: _Provider(),
+    )[0]
+
+    assert material.proposal.material_kind == "search_snippet"
+    assert evaluate_source_eligibility(
+        material.proposal,
+        raw_payload_present=True,
+    ) == (False, "ineligible_search_snippet")
 
 
 def test_executable_source_parameters_change_spec_and_route_fingerprints(

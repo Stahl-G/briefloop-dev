@@ -64,6 +64,7 @@ from multi_agent_brief.contracts.v2 import (
     ArtifactSupersessionRecord,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     RunIdentity,
     RunIntegrityRecord,
     RunArchiveArtifactBinding,
@@ -114,6 +115,7 @@ _EXTENDED_RECORD_MODELS = (
     ProposalSourceBinding,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     OwnedArtifactSubmissionRecord,
     StageTransitionRecord,
     StageArtifactBinding,
@@ -348,6 +350,9 @@ class ControlStoreSnapshot:
     proposal_source_bindings: tuple[ProposalSourceBinding, ...]
     run_contract_bindings: tuple[RunContractBinding, ...]
     run_execution_authorizations: tuple[RunExecutionAuthorization, ...]
+    run_source_discovery_authorizations: tuple[
+        RunSourceDiscoveryAuthorization, ...
+    ]
     owned_artifact_submissions: tuple[OwnedArtifactSubmissionRecord, ...]
     stage_transitions: tuple[StageTransitionRecord, ...]
     stage_artifact_bindings: tuple[StageArtifactBinding, ...]
@@ -652,6 +657,11 @@ class ControlStoreHistory:
             ("authorization_id",),
             full.run_execution_authorizations,
         )
+        run_source_discovery_authorizations = selected(
+            "run_source_discovery_authorizations",
+            ("authorization_id",),
+            full.run_source_discovery_authorizations,
+        )
         stage_artifact_bindings = selected(
             "stage_artifact_bindings",
             ("transition_id", "position"),
@@ -816,6 +826,9 @@ class ControlStoreHistory:
             proposal_source_bindings=proposal_source_bindings,
             run_contract_bindings=run_contract_bindings,
             run_execution_authorizations=run_execution_authorizations,
+            run_source_discovery_authorizations=(
+                run_source_discovery_authorizations
+            ),
             owned_artifact_submissions=owned_artifact_submissions,
             stage_transitions=stage_transitions,
             stage_artifact_bindings=stage_artifact_bindings,
@@ -1497,6 +1510,9 @@ class SQLiteControlStore:
                 self._insert_run_execution_authorization(
                     uow._run_execution_authorization
                 )
+                self._insert_run_source_discovery_authorization(
+                    uow._run_source_discovery_authorization
+                )
                 self._insert_owned_artifact_submissions(
                     uow._owned_artifact_submissions.values()
                 )
@@ -1869,6 +1885,23 @@ class SQLiteControlStore:
         }
 
         binding = uow._run_contract_binding
+        existing_binding_row = self._connection.execute(
+            """
+            SELECT contract_fingerprint
+            FROM run_contract_bindings
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        binding_fingerprint = (
+            binding.contract_fingerprint
+            if binding is not None
+            else (
+                None
+                if existing_binding_row is None
+                else str(existing_binding_row[0])
+            )
+        )
         if binding is not None:
             refs = {
                 (binding.stage_specs_artifact.artifact_id, binding.stage_specs_artifact.revision),
@@ -1896,10 +1929,40 @@ class SQLiteControlStore:
                     execution_authorization.source_manifest_artifact.revision,
                 )
                 not in available_revisions
-                or binding is None
                 or execution_authorization.run_contract_fingerprint
-                != binding.contract_fingerprint
+                != binding_fingerprint
             ):
+                raise ControlStoreConflict("relational_integrity_conflict")
+
+        discovery_authorization = uow._run_source_discovery_authorization
+        if discovery_authorization is not None:
+            if (
+                discovery_authorization.accepted_transaction_id
+                != uow.transaction_id
+                or discovery_authorization.authorization_event_id
+                not in staged_events
+                or binding is None
+                or discovery_authorization.run_contract_fingerprint
+                != binding.contract_fingerprint
+                or discovery_authorization.runtime_source_plan_fingerprint
+                != binding.runtime_source_plan_fingerprint
+            ):
+                raise ControlStoreConflict("relational_integrity_conflict")
+        for authorization_id, referenced in (
+            uow._referenced_source_discovery_authorizations.items()
+        ):
+            if discovery_authorization is not None and (
+                authorization_id == discovery_authorization.authorization_id
+            ):
+                continue
+            row = self._connection.execute(
+                "SELECT payload_json FROM run_source_discovery_authorizations "
+                "WHERE run_id=? AND authorization_id=?",
+                (run_id, authorization_id),
+            ).fetchone()
+            if row is None or _decode_record(
+                RunSourceDiscoveryAuthorization, str(row[0])
+            ) != referenced:
                 raise ControlStoreConflict("relational_integrity_conflict")
 
         for record in uow._owned_artifact_submissions.values():
@@ -1952,6 +2015,7 @@ class SQLiteControlStore:
             (
                 uow._run_contract_binding is not None,
                 uow._run_execution_authorization is not None,
+                uow._run_source_discovery_authorization is not None,
                 bool(uow._owned_artifact_submissions),
                 bool(uow._stage_transitions),
                 bool(uow._claims),
@@ -2283,6 +2347,12 @@ class SQLiteControlStore:
                         if uow._run_execution_authorization is not None
                         else []
                     ),
+                    "run_source_discovery_authorizations": [
+                        {"authorization_id": authorization_id}
+                        for authorization_id in sorted(
+                            uow._referenced_source_discovery_authorizations
+                        )
+                    ],
                     "owned_artifact_submissions": [
                         {"submission_id": key}
                         for key in sorted(uow._owned_artifact_submissions)
@@ -3061,6 +3131,47 @@ class SQLiteControlStore:
             ),
         )
 
+    def _insert_run_source_discovery_authorization(
+        self,
+        record: RunSourceDiscoveryAuthorization | None,
+    ) -> None:
+        if record is None:
+            return
+        self._connection.execute(
+            """
+            INSERT INTO run_source_discovery_authorizations(
+                run_id, authorization_id, workspace_id, schema_version,
+                run_contract_fingerprint, run_direction_fingerprint,
+                runtime_source_plan_fingerprint, source_route_id,
+                route_fingerprint, provider_id, execution_owner,
+                secret_env_name, completion_target, repair_budget,
+                authorization_event_id, accepted_transaction_id,
+                request_fingerprint, created_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.run_id,
+                record.authorization_id,
+                record.workspace_id,
+                record.schema_version,
+                record.run_contract_fingerprint,
+                record.run_direction_fingerprint,
+                record.runtime_source_plan_fingerprint,
+                record.source_route_id,
+                record.route_fingerprint,
+                record.provider_id,
+                record.execution_owner,
+                record.secret_env_name,
+                record.completion_target,
+                record.repair_budget,
+                record.authorization_event_id,
+                record.accepted_transaction_id,
+                record.request_fingerprint,
+                record.created_at,
+                _canonical_record_text(record),
+            ),
+        )
+
     def _insert_owned_artifact_submissions(
         self,
         records: Iterable[OwnedArtifactSubmissionRecord],
@@ -3758,6 +3869,22 @@ class SQLiteControlStore:
             self._connection.execute(
                 """
                 INSERT INTO transaction_run_execution_authorizations(
+                    run_id, transaction_id, position, authorization_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    receipt.run_id,
+                    receipt.transaction_id,
+                    position,
+                    reference.authorization_id,
+                ),
+            )
+        for position, reference in enumerate(
+            receipt.run_source_discovery_authorizations
+        ):
+            self._connection.execute(
+                """
+                INSERT INTO transaction_run_source_discovery_authorizations(
                     run_id, transaction_id, position, authorization_id
                 ) VALUES (?, ?, ?, ?)
                 """,
@@ -4663,6 +4790,34 @@ class SQLiteControlStore:
                     "created_at": "created_at",
                 },
             ),
+            run_source_discovery_authorizations=self._load_for_run(
+                RunSourceDiscoveryAuthorization,
+                "run_source_discovery_authorizations",
+                run_id,
+                "authorization_id",
+                {
+                    "run_id": "run_id",
+                    "authorization_id": "authorization_id",
+                    "workspace_id": "workspace_id",
+                    "schema_version": "schema_version",
+                    "run_contract_fingerprint": "run_contract_fingerprint",
+                    "run_direction_fingerprint": "run_direction_fingerprint",
+                    "runtime_source_plan_fingerprint": (
+                        "runtime_source_plan_fingerprint"
+                    ),
+                    "source_route_id": "source_route_id",
+                    "route_fingerprint": "route_fingerprint",
+                    "provider_id": "provider_id",
+                    "execution_owner": "execution_owner",
+                    "secret_env_name": "secret_env_name",
+                    "completion_target": "completion_target",
+                    "repair_budget": "repair_budget",
+                    "authorization_event_id": "authorization_event_id",
+                    "accepted_transaction_id": "accepted_transaction_id",
+                    "request_fingerprint": "request_fingerprint",
+                    "created_at": "created_at",
+                },
+            ),
             owned_artifact_submissions=self._load_for_run(
                 OwnedArtifactSubmissionRecord,
                 "owned_artifact_submissions",
@@ -5453,6 +5608,8 @@ class SQLiteControlStore:
         core_rows_exist = any(
             (
                 snapshot.run_contract_bindings,
+                snapshot.run_execution_authorizations,
+                snapshot.run_source_discovery_authorizations,
                 snapshot.owned_artifact_submissions,
                 snapshot.stage_transitions,
                 snapshot.stage_artifact_bindings,
@@ -5621,6 +5778,36 @@ class SQLiteControlStore:
                 revision is None
                 or revision.sha256 != digest
                 or (artifact_id, revision_number) not in receipt_revision_refs
+            ):
+                raise ControlStoreIntegrityError("core_run_relation_invalid")
+
+        if len(snapshot.run_source_discovery_authorizations) > 1:
+            raise ControlStoreIntegrityError("core_run_relation_invalid")
+        for authorization in snapshot.run_source_discovery_authorizations:
+            owner = receipts.get(authorization.accepted_transaction_id)
+            if (
+                authorization.run_id != snapshot.run.run_id
+                or authorization.workspace_id != snapshot.workspace_id
+                or authorization.run_contract_fingerprint
+                != binding.contract_fingerprint
+                or authorization.run_direction_fingerprint
+                != canonical_fingerprint(
+                    canonical_run_direction_for_binding(
+                        binding.run_direction.model_dump(
+                            mode="json", exclude_unset=False
+                        )
+                    )
+                )
+                or authorization.runtime_source_plan_fingerprint
+                != binding.runtime_source_plan_fingerprint
+                or owner is None
+                or owner.transaction_type != "core-v2-initialize"
+                or [
+                    item.authorization_id
+                    for item in owner.run_source_discovery_authorizations
+                ]
+                != [authorization.authorization_id]
+                or authorization.authorization_event_id not in owner.event_ids
             ):
                 raise ControlStoreIntegrityError("core_run_relation_invalid")
 
@@ -6399,6 +6586,14 @@ class SQLiteControlStore:
                 ),
             ),
             (
+                "transaction_run_source_discovery_authorizations",
+                ("authorization_id",),
+                tuple(
+                    (item.authorization_id,)
+                    for item in receipt.run_source_discovery_authorizations
+                ),
+            ),
+            (
                 "transaction_owned_artifact_submissions",
                 ("submission_id",),
                 tuple(
@@ -7111,6 +7306,20 @@ class SQLiteControlStore:
                 domain_keys.add(key)
             if domain_keys != set(owners):
                 raise ControlStoreIntegrityError("transaction_ledger_integrity_invalid")
+        discovery_rows = self._connection.execute(
+            "SELECT run_id,authorization_id,accepted_transaction_id "
+            "FROM run_source_discovery_authorizations"
+        ).fetchall()
+        for run_id, authorization_id, accepted_transaction_id in discovery_rows:
+            owner = self._connection.execute(
+                "SELECT 1 FROM transaction_run_source_discovery_authorizations "
+                "WHERE run_id=? AND transaction_id=? AND authorization_id=?",
+                (run_id, accepted_transaction_id, authorization_id),
+            ).fetchone()
+            if owner is None:
+                raise ControlStoreIntegrityError(
+                    "transaction_ledger_integrity_invalid"
+                )
 
     def _verify_pr4b_relation_coverage(self) -> None:
         """Prove every PR-4B authoritative row has one receipt owner."""

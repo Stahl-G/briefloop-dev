@@ -27,6 +27,7 @@ class SearchResult:
     published_at: str = ""
     source_name: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    raw_content: str | None = None
 
 
 class SearchBackend(ABC):
