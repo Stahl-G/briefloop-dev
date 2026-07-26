@@ -185,6 +185,14 @@ def test_get_assets_and_security_headers(server) -> None:
     assert b"submission_search_secret_store_failed" in body
     assert b'search_secret_status === "pending"' in body
     assert b'search_secret_status === "recovered"' in body
+    assert b'"cf_replayed_recovered_badge"' in body
+    assert b'"cf_replayed_ready_badge"' in body
+    assert b'"cf_replayed_receipt_badge"' in body
+    assert b't("cf_replayed_badge")' not in body
+    assert b'var replayBadgeKey = response.search_secret_status === "recovered"' in body
+    assert b': response.search_secret_status === "ready"' in body
+    assert b"replayed \xc2\xb7 credential recovered" in body
+    assert b"replayed \xc2\xb7 original receipt" in body
     assert b"nothing was written" in body
     assert b"Workspace initialization committed" in body
     assert (
