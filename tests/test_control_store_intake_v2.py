@@ -15,6 +15,7 @@ from multi_agent_brief.contracts.v2 import (
     Invocation,
     RunIdentity,
     SourceCommitRequest,
+    SourcePackCommitRequest,
     StageState,
     SourceProposal,
     WorkspaceRunHead,
@@ -26,7 +27,11 @@ from multi_agent_brief.control_store import (
 )
 from multi_agent_brief.control_store.serialization import canonical_fingerprint
 from multi_agent_brief.intake_v2.errors import IntakeError, IntakeResult
-from multi_agent_brief.intake_v2.service import IntakeService
+from multi_agent_brief.intake_v2.service import (
+    IntakeService,
+    _SourcePackBytes,
+    _SourcePackMemberBytes,
+)
 from multi_agent_brief.intake_v2.policy import (
     SourcePolicyError,
     evaluate_source_eligibility,
@@ -175,6 +180,80 @@ def _source_request(workspace: Path, *, expected_revision: int = 1) -> Path:
         },
     )
     return request
+
+
+def _source_pack_request(
+    workspace: Path,
+    *,
+    expected_revision: int = 1,
+) -> tuple[Path, bytes, bytes, bytes, bytes]:
+    scratch = workspace / "scratch" / "INV-SOURCE-001"
+    member_root = scratch / "sources" / "SRC-PACK-001"
+    manifest = b'{"schema_version":"example.source_manifest.v1","sources":[]}'
+    content = b"Durable source-pack content A.\n"
+    raw = b'{"provider":"synthetic","version":"A"}'
+    manifest_sha = hashlib.sha256(manifest).hexdigest()
+    proposal = _write_json(
+        member_root / "source_proposal.json",
+        {
+            "schema_version": "briefloop.source_proposal.v2",
+            "proposal_id": "PROP-SOURCE-PACK-001",
+            "run_id": RUN_ID,
+            "source_id": "SRC-PACK-001",
+            "origin_type": "provider_response",
+            "acquisition_method": "provider_extract",
+            "material_kind": "full_content",
+            "provider": "synthetic-provider",
+            "locator": {"kind": "web", "url": "https://example.com/source-pack"},
+            "title": "Synthetic source pack",
+            "publisher": "Example Publisher",
+            "published_at": "2026-07-14",
+            "retrieved_at": NOW,
+            "source_category": "market_report",
+            "retrieval_source_type": "paper_page",
+            "underlying_evidence_type": "market_data",
+            "raw_underlying_evidence_type": "research-report",
+            "content_sha256": hashlib.sha256(content).hexdigest(),
+            "content_media_type": "text/plain",
+            "raw_payload_sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_payload_media_type": "application/json",
+            "source_manifest_sha256": manifest_sha,
+        },
+    )
+    (member_root / "source_content.txt").write_bytes(content)
+    (member_root / "source_raw.json").write_bytes(raw)
+    (scratch / "source_manifest.json").write_bytes(manifest)
+    request = scratch / "submit_request.json"
+    _write_json(
+        request,
+        {
+            "schema_version": "briefloop.source_pack_commit_request.v2",
+            "request_id": "REQ-SOURCE-PACK-001",
+            "run_id": RUN_ID,
+            "invocation_id": "INV-SOURCE-001",
+            "members": [
+                {
+                    "member_id": "SRC-PACK-001",
+                    "proposal_path": (
+                        "scratch/INV-SOURCE-001/sources/SRC-PACK-001/"
+                        "source_proposal.json"
+                    ),
+                    "content_path": (
+                        "scratch/INV-SOURCE-001/sources/SRC-PACK-001/"
+                        "source_content.txt"
+                    ),
+                    "raw_payload_path": (
+                        "scratch/INV-SOURCE-001/sources/SRC-PACK-001/"
+                        "source_raw.json"
+                    ),
+                }
+            ],
+            "manifest_path": "scratch/INV-SOURCE-001/source_manifest.json",
+            "expected_manifest_sha256": manifest_sha,
+            "expected_store_revision": expected_revision,
+        },
+    )
+    return request, manifest, proposal, content, raw
 
 
 def _candidate_request(workspace: Path, *, expected_revision: int = 2) -> Path:
@@ -598,6 +677,219 @@ def test_host_source_writer_consumes_verified_bytes_without_reopening_paths(
         assert replacement_sha not in repr(snapshot)
         assert replacement_sha not in repr(history.transactions)
         assert replacement_sha.encode() not in (workspace / "briefloop.db").read_bytes()
+
+
+def test_host_source_pack_writer_consumes_complete_verified_pack_without_reopening_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    request_path, manifest_a, proposal_a, content_a, raw_a = _source_pack_request(
+        workspace
+    )
+    request_a = SourcePackCommitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    pack_a = _SourcePackBytes(
+        manifest_bytes=manifest_a,
+        members=(
+            _SourcePackMemberBytes(
+                proposal_bytes=proposal_a,
+                content_bytes=content_a,
+                raw_bytes=raw_a,
+            ),
+        ),
+    )
+    manifest_b = b'{"schema_version":"example.source_manifest.v1","sources":["B"]}'
+    content_b = b"Self-consistent replacement source-pack content B.\n"
+    raw_b = b'{"provider":"synthetic","version":"B"}'
+    proposal_b_payload = json.loads(proposal_a)
+    proposal_b_payload.update(
+        title="Replacement source pack",
+        content_sha256=hashlib.sha256(content_b).hexdigest(),
+        raw_payload_sha256=hashlib.sha256(raw_b).hexdigest(),
+        source_manifest_sha256=hashlib.sha256(manifest_b).hexdigest(),
+    )
+    proposal_b = json.dumps(
+        proposal_b_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    request_b_payload = request_a.model_dump(mode="json", exclude_unset=False)
+    request_b_payload["expected_manifest_sha256"] = hashlib.sha256(
+        manifest_b
+    ).hexdigest()
+    request_path.write_bytes(
+        json.dumps(
+            request_b_payload, sort_keys=True, separators=(",", ":")
+        ).encode()
+    )
+    request_b = SourcePackCommitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    scratch = request_path.parent
+    member_root = scratch / "sources" / "SRC-PACK-001"
+    (scratch / "source_manifest.json").write_bytes(manifest_b)
+    (member_root / "source_proposal.json").write_bytes(proposal_b)
+    (member_root / "source_content.txt").write_bytes(content_b)
+    (member_root / "source_raw.json").write_bytes(raw_b)
+    pack_b = _SourcePackBytes(
+        manifest_bytes=manifest_b,
+        members=(
+            _SourcePackMemberBytes(
+                proposal_bytes=proposal_b,
+                content_bytes=content_b,
+                raw_bytes=raw_b,
+            ),
+        ),
+    )
+
+    service = IntakeService(workspace, clock=CLOCK)
+    committed = service._submit_source_pack_from_host(request_a, pack_a)
+    replayed = service._submit_source_pack_from_host(request_a, pack_a)
+    conflict = service._submit_source_pack_from_host(request_b, pack_b)
+
+    assert committed.status == "committed"
+    assert replayed.status == "replayed"
+    assert replayed.receipt == committed.receipt
+    assert conflict.error_code == "submission_replay_conflict"
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(RUN_ID)
+        source = snapshot.sources[0]
+        event = next(
+            item
+            for item in snapshot.events
+            if item.intake_binding is not None
+            and item.intake_binding.request_id == request_a.request_id
+        )
+        assert snapshot.store_revision == 2
+        assert source.title == "Synthetic source pack"
+        assert source.content_sha256 == hashlib.sha256(content_a).hexdigest()
+        assert source.raw_payload_sha256 == hashlib.sha256(raw_a).hexdigest()
+        assert source.source_manifest_sha256 == hashlib.sha256(manifest_a).hexdigest()
+        assert event.intake_binding is not None
+        assert (workspace / source.content_blob_path).read_bytes() == content_a
+        assert source.raw_payload_blob_path is not None
+        assert (workspace / source.raw_payload_blob_path).read_bytes() == raw_a
+        database_bytes = (workspace / "briefloop.db").read_bytes()
+        assert content_b not in database_bytes
+        assert raw_b not in database_bytes
+
+
+@pytest.mark.parametrize(
+    ("component", "replacement"),
+    [
+        ("request", b'{"replacement":"request"}'),
+        ("manifest", b'{"replacement":"manifest"}'),
+        ("proposal", b'{"replacement":"proposal"}'),
+        ("content", b"replacement content"),
+        ("raw", b'{"replacement":"raw"}'),
+    ],
+)
+def test_host_source_pack_each_materialized_component_is_non_authoritative(
+    tmp_path: Path,
+    component: str,
+    replacement: bytes,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    request_path, manifest, proposal, content, raw = _source_pack_request(workspace)
+    request = SourcePackCommitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    paths = {
+        "request": request_path,
+        "manifest": workspace / str(request.manifest_path),
+        "proposal": workspace / request.members[0].proposal_path,
+        "content": workspace / request.members[0].content_path,
+        "raw": workspace / str(request.members[0].raw_payload_path),
+    }
+    paths[component].write_bytes(replacement)
+    result = IntakeService(
+        workspace, clock=CLOCK
+    )._submit_source_pack_from_host(
+        request,
+        _SourcePackBytes(
+            manifest_bytes=manifest,
+            members=(
+                _SourcePackMemberBytes(
+                    proposal_bytes=proposal,
+                    content_bytes=content,
+                    raw_bytes=raw,
+                ),
+            ),
+        ),
+    )
+    assert result.status == "committed"
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        source = store.load_snapshot(RUN_ID).sources[0]
+    assert source.content_sha256 == hashlib.sha256(content).hexdigest()
+    assert source.raw_payload_sha256 == hashlib.sha256(raw).hexdigest()
+    assert (workspace / source.content_blob_path).read_bytes() == content
+    assert source.raw_payload_blob_path is not None
+    assert (workspace / source.raw_payload_blob_path).read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("manifest_hash", "source_hash_mismatch"),
+        ("malformed_proposal", "proposal_contract_invalid"),
+        ("proposal_manifest", "proposal_contract_invalid"),
+        ("content_hash", "source_hash_mismatch"),
+        ("raw_hash", "source_hash_mismatch"),
+        ("cross_run", "proposal_contract_invalid"),
+    ],
+)
+def test_host_source_pack_invalid_supplied_bytes_are_typed_and_zero_write(
+    tmp_path: Path,
+    case: str,
+    expected_error: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    request_path, manifest, proposal, content, raw = _source_pack_request(workspace)
+    request = SourcePackCommitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    proposal_payload = json.loads(proposal)
+    if case == "manifest_hash":
+        manifest = b"wrong manifest bytes"
+    elif case == "malformed_proposal":
+        proposal = b"{}"
+    elif case == "proposal_manifest":
+        proposal_payload["source_manifest_sha256"] = "0" * 64
+        proposal = json.dumps(proposal_payload).encode()
+    elif case == "content_hash":
+        content = b"wrong content bytes"
+    elif case == "raw_hash":
+        raw = b"wrong raw bytes"
+    elif case == "cross_run":
+        proposal_payload["run_id"] = "RUN-OTHER"
+        proposal = json.dumps(proposal_payload).encode()
+    else:
+        raise AssertionError(case)
+    result = IntakeService(
+        workspace, clock=CLOCK
+    )._submit_source_pack_from_host(
+        request,
+        _SourcePackBytes(
+            manifest_bytes=manifest,
+            members=(
+                _SourcePackMemberBytes(
+                    proposal_bytes=proposal,
+                    content_bytes=content,
+                    raw_bytes=raw,
+                ),
+            ),
+        ),
+    )
+    assert result.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": expected_error,
+    }
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(RUN_ID)
+        assert store.current_revision == 1
+    assert snapshot.sources == ()
 
 
 def test_host_proposal_writer_consumes_verified_bytes_without_reopening_paths(

@@ -91,6 +91,23 @@ class _PreparedSourcePackMember:
 
 
 @dataclass(frozen=True)
+class _SourcePackMemberBytes:
+    """Immutable member bytes consumed by the sole source-pack writer."""
+
+    proposal_bytes: bytes
+    content_bytes: bytes
+    raw_bytes: bytes | None
+
+
+@dataclass(frozen=True)
+class _SourcePackBytes:
+    """Immutable source-pack bytes; materialized paths carry no authority."""
+
+    manifest_bytes: bytes | None
+    members: tuple[_SourcePackMemberBytes, ...]
+
+
+@dataclass(frozen=True)
 class _CoreAuthorizedSourcePack:
     """Core-derived, non-file input for the authorized atomic source writer."""
 
@@ -192,6 +209,31 @@ class IntakeService:
                 error_code="commit_outcome_unknown",
             )
         except IntakeError as exc:
+            return IntakeResult(status="failed_uncommitted", error_code=exc.code)
+
+    def _submit_source_pack_from_host(
+        self,
+        request: SourcePackCommitRequest,
+        pack: _SourcePackBytes,
+    ) -> IntakeResult:
+        """Consume RuntimeHost-verified pack bytes through this sole writer."""
+
+        try:
+            if type(request) is not SourcePackCommitRequest:
+                raise IntakeError("intake_request_invalid")
+            with self._open_store() as store:
+                self._reject_authorized_source_file_entrypoint(
+                    store,
+                    request.run_id,
+                    request.request_id,
+                )
+            return self._submit_source_pack_bytes(request, pack)
+        except ControlStoreCommitOutcomeUnknown:
+            return IntakeResult(
+                status="commit_outcome_unknown",
+                error_code="commit_outcome_unknown",
+            )
+        except (IntakeError, _KnownInvalid) as exc:
             return IntakeResult(status="failed_uncommitted", error_code=exc.code)
 
     def _commit_authorized_source_pack_from_core(
@@ -716,12 +758,7 @@ class IntakeService:
             if request.manifest_path is None
             else self._reader.read(request.manifest_path)
         )
-        if manifest_bytes is not None and (
-            request.expected_manifest_sha256 != sha256_hex(manifest_bytes)
-        ):
-            raise IntakeError("source_hash_mismatch")
-        payloads: list[tuple[bytes, bytes, bytes | None]] = []
-        fingerprint_members: list[dict[str, object]] = []
+        payloads: list[_SourcePackMemberBytes] = []
         for member in request.members:
             proposal_bytes = self._reader.read(member.proposal_path)
             content_bytes = self._reader.read(member.content_path)
@@ -730,17 +767,64 @@ class IntakeService:
                 if member.raw_payload_path is None
                 else self._reader.read(member.raw_payload_path)
             )
-            payloads.append((proposal_bytes, content_bytes, raw_bytes))
-            fingerprint_members.append(
-                {
-                    "member_id": member.member_id,
-                    "proposal_sha256": sha256_hex(proposal_bytes),
-                    "content_sha256": sha256_hex(content_bytes),
-                    "raw_payload_sha256": (
-                        None if raw_bytes is None else sha256_hex(raw_bytes)
-                    ),
-                }
+            payloads.append(
+                _SourcePackMemberBytes(
+                    proposal_bytes=proposal_bytes,
+                    content_bytes=content_bytes,
+                    raw_bytes=raw_bytes,
+                )
             )
+        return self._submit_source_pack_bytes(
+            request,
+            _SourcePackBytes(
+                manifest_bytes=manifest_bytes,
+                members=tuple(payloads),
+            ),
+        )
+
+    def _submit_source_pack_bytes(
+        self,
+        request: SourcePackCommitRequest,
+        pack: _SourcePackBytes,
+    ) -> IntakeResult:
+        if (
+            type(pack) is not _SourcePackBytes
+            or type(pack.members) is not tuple
+            or len(pack.members) != len(request.members)
+            or (
+                pack.manifest_bytes is not None
+                and type(pack.manifest_bytes) is not bytes
+            )
+            or any(
+                type(item) is not _SourcePackMemberBytes
+                or type(item.proposal_bytes) is not bytes
+                or type(item.content_bytes) is not bytes
+                or (
+                    item.raw_bytes is not None
+                    and type(item.raw_bytes) is not bytes
+                )
+                for item in pack.members
+            )
+        ):
+            raise IntakeError("intake_request_invalid")
+        manifest_bytes = pack.manifest_bytes
+        if manifest_bytes is not None and (
+            request.expected_manifest_sha256 != sha256_hex(manifest_bytes)
+        ):
+            raise IntakeError("source_hash_mismatch")
+        fingerprint_members = [
+            {
+                "member_id": member.member_id,
+                "proposal_sha256": sha256_hex(payload.proposal_bytes),
+                "content_sha256": sha256_hex(payload.content_bytes),
+                "raw_payload_sha256": (
+                    None
+                    if payload.raw_bytes is None
+                    else sha256_hex(payload.raw_bytes)
+                ),
+            }
+            for member, payload in zip(request.members, pack.members, strict=True)
+        ]
         request_fingerprint = canonical_fingerprint(
             {
                 "lane": "source_pack",
@@ -779,11 +863,14 @@ class IntakeService:
             prepared: list[_PreparedSourcePackMember] = []
             source_ids: set[str] = set()
             artifact_ids: set[str] = set()
-            for member, (proposal_bytes, content_bytes, raw_bytes) in zip(
+            for member, payload in zip(
                 request.members,
-                payloads,
+                pack.members,
                 strict=True,
             ):
+                proposal_bytes = payload.proposal_bytes
+                content_bytes = payload.content_bytes
+                raw_bytes = payload.raw_bytes
                 proposal = cast(
                     SourceProposal,
                     self._parse_proposal(SourceProposal, proposal_bytes),

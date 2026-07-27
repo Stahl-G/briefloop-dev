@@ -99,6 +99,8 @@ from multi_agent_brief.intake_v2.scratch import ScratchReader, parse_json_object
 from multi_agent_brief.intake_v2.service import (
     IntakeService,
     _CoreDiscoverySourcePack,
+    _SourcePackBytes,
+    _SourcePackMemberBytes,
 )
 from multi_agent_brief.sources.search_backends.base import SearchBackendError
 from multi_agent_brief.outputs.reader_projection import (
@@ -153,6 +155,14 @@ class _RoleOutputSpec:
     proposal_lane: str | None = None
     proposal_model: type[StrictModel] | None = None
     producer_tool_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _VerifiedSourcePackSubmission:
+    """One immutable Host verification result for materialization and Intake."""
+
+    request: SourcePackCommitRequest
+    pack: _SourcePackBytes
 
 
 _ROLE_OUTPUTS: dict[str, _RoleOutputSpec] = {
@@ -1849,20 +1859,23 @@ class RuntimeHostService:
         stage: VerifiedSourceStage,
         *,
         commit_request_id: str,
-    ) -> str:
+    ) -> _VerifiedSourcePackSubmission:
         invocation_id = dispatch.envelope.invocation_id
+        manifest_bytes: bytes | None = None
         if stage.manifest_path is not None:
             if stage.manifest_sha256 is None:
                 raise RuntimeHostError("runtime_source_staging_invalid")
+            manifest_bytes = read_verified_staged_bytes(
+                stage.manifest_path,
+                expected_sha256=stage.manifest_sha256,
+                max_size=4 * 1024 * 1024,
+            )
             self._materialize_tool_input(
                 f"scratch/{invocation_id}/source_manifest.json",
-                read_verified_staged_bytes(
-                    stage.manifest_path,
-                    expected_sha256=stage.manifest_sha256,
-                    max_size=4 * 1024 * 1024,
-                ),
+                manifest_bytes,
             )
         members: list[dict[str, object]] = []
+        member_bytes: list[_SourcePackMemberBytes] = []
         for member in stage.members:
             root = f"scratch/{invocation_id}/sources/{member.member_id}"
             proposal_path = f"{root}/source_proposal.json"
@@ -1870,29 +1883,33 @@ class RuntimeHostService:
             raw_path = (
                 None if member.raw_payload_path is None else f"{root}/source_raw.json"
             )
+            proposal_bytes = read_verified_staged_bytes(
+                member.proposal_path,
+                expected_sha256=member.proposal_sha256,
+            )
+            content_bytes = read_verified_staged_bytes(
+                member.content_path,
+                expected_sha256=member.content_sha256,
+            )
             self._materialize_tool_input(
                 proposal_path,
-                read_verified_staged_bytes(
-                    member.proposal_path,
-                    expected_sha256=member.proposal_sha256,
-                ),
+                proposal_bytes,
             )
             self._materialize_tool_input(
                 content_path,
-                read_verified_staged_bytes(
-                    member.content_path,
-                    expected_sha256=member.content_sha256,
-                ),
+                content_bytes,
             )
+            raw_bytes: bytes | None = None
             if member.raw_payload_path is not None and raw_path is not None:
                 if member.raw_payload_sha256 is None:
                     raise RuntimeHostError("runtime_source_staging_invalid")
+                raw_bytes = read_verified_staged_bytes(
+                    member.raw_payload_path,
+                    expected_sha256=member.raw_payload_sha256,
+                )
                 self._materialize_tool_input(
                     raw_path,
-                    read_verified_staged_bytes(
-                        member.raw_payload_path,
-                        expected_sha256=member.raw_payload_sha256,
-                    ),
+                    raw_bytes,
                 )
             members.append(
                 {
@@ -1901,6 +1918,13 @@ class RuntimeHostService:
                     "content_path": content_path,
                     "raw_payload_path": raw_path,
                 }
+            )
+            member_bytes.append(
+                _SourcePackMemberBytes(
+                    proposal_bytes=proposal_bytes,
+                    content_bytes=content_bytes,
+                    raw_bytes=raw_bytes,
+                )
             )
         submit = SourcePackCommitRequest.model_validate(
             {
@@ -1919,11 +1943,17 @@ class RuntimeHostService:
             },
             strict=True,
         )
-        submit_path = self._materialize_tool_input(
+        self._materialize_tool_input(
             f"scratch/{invocation_id}/submit_request.json",
             canonical_json_bytes(submit.model_dump(mode="json", exclude_unset=False)),
         )
-        return submit_path.relative_to(self.workspace).as_posix()
+        return _VerifiedSourcePackSubmission(
+            request=submit,
+            pack=_SourcePackBytes(
+                manifest_bytes=manifest_bytes,
+                members=tuple(member_bytes),
+            ),
+        )
 
     def _submit_staged_source_pack(
         self,
@@ -1934,7 +1964,7 @@ class RuntimeHostService:
         stage_identity: str,
     ) -> RuntimeInvocationResult:
         try:
-            relative = self._materialize_staged_source_pack(
+            verified = self._materialize_staged_source_pack(
                 dispatch,
                 stage,
                 commit_request_id=commit_request_id,
@@ -1951,9 +1981,15 @@ class RuntimeHostService:
             )
             return result
         intake = IntakeService(self.workspace)
-        result = intake.submit_source_pack(relative)
+        result = intake._submit_source_pack_from_host(
+            verified.request,
+            verified.pack,
+        )
         if result.status == "commit_outcome_unknown":
-            result = intake.submit_source_pack(relative)
+            result = intake._submit_source_pack_from_host(
+                verified.request,
+                verified.pack,
+            )
         runtime_result = self._source_pack_runtime_result(
             dispatch.envelope.invocation_id,
             result,

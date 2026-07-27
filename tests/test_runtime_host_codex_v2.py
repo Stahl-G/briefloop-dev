@@ -1418,6 +1418,95 @@ def test_deterministic_source_failure_exhausts_frozen_route_without_retry(
         json.dumps(request_payload, sort_keys=True),
         encoding="utf-8",
     )
+    original_host_submit = IntakeService._submit_source_pack_from_host
+    host_submit_calls = 0
+    replacement_bytes: list[bytes] = []
+
+    def replace_materialized_pack_then_report_unknown(self, request, pack):
+        nonlocal host_submit_calls
+        host_submit_calls += 1
+        if host_submit_calls == 1:
+            replacement_contents = [
+                f"Replacement content B for {member.member_id}.\n".encode()
+                for member in request.members
+            ]
+            replacement_manifest = deepcopy(manifest_payload)
+            for entry, replacement_content in zip(
+                replacement_manifest["sources"],
+                replacement_contents,
+                strict=True,
+            ):
+                entry["sha256"] = hashlib.sha256(replacement_content).hexdigest()
+            replacement_manifest_bytes = json.dumps(
+                replacement_manifest,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            replacement_manifest_sha = hashlib.sha256(
+                replacement_manifest_bytes
+            ).hexdigest()
+            assert request.manifest_path is not None
+            (workspace / request.manifest_path).write_bytes(
+                replacement_manifest_bytes
+            )
+            replacement_bytes.append(replacement_manifest_bytes)
+            for member, verified, replacement_content in zip(
+                request.members,
+                pack.members,
+                replacement_contents,
+                strict=True,
+            ):
+                replacement_proposal = json.loads(verified.proposal_bytes)
+                replacement_proposal["title"] = (
+                    f"Replacement title B for {member.member_id}"
+                )
+                replacement_proposal["content_sha256"] = hashlib.sha256(
+                    replacement_content
+                ).hexdigest()
+                replacement_proposal["source_manifest_sha256"] = (
+                    replacement_manifest_sha
+                )
+                replacement_proposal_bytes = json.dumps(
+                    replacement_proposal,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                (workspace / member.proposal_path).write_bytes(
+                    replacement_proposal_bytes
+                )
+                (workspace / member.content_path).write_bytes(replacement_content)
+                replacement_bytes.extend(
+                    (replacement_proposal_bytes, replacement_content)
+                )
+            replacement_request = request.model_dump(
+                mode="json", exclude_unset=False
+            )
+            replacement_request["expected_manifest_sha256"] = (
+                replacement_manifest_sha
+            )
+            replacement_request_bytes = json.dumps(
+                replacement_request,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            (
+                workspace / "scratch" / request.invocation_id / "submit_request.json"
+            ).write_bytes(replacement_request_bytes)
+            replacement_bytes.append(replacement_request_bytes)
+        result = original_host_submit(self, request, pack)
+        if host_submit_calls == 1:
+            assert result.status == "committed"
+            return IntakeResult(
+                status="commit_outcome_unknown",
+                error_code="commit_outcome_unknown",
+            )
+        return result
+
+    monkeypatch.setattr(
+        IntakeService,
+        "_submit_source_pack_from_host",
+        replace_materialized_pack_then_report_unknown,
+    )
     assert (
         main(
             [
@@ -1434,7 +1523,8 @@ def test_deterministic_source_failure_exhausts_frozen_route_without_retry(
         == 0
     )
     accepted_manual = json.loads(capsys.readouterr().out)
-    assert accepted_manual["status"] == "committed", accepted_manual
+    assert accepted_manual["status"] == "replayed", accepted_manual
+    assert host_submit_calls == 2
     with SQLiteControlStore.open(workspace / "briefloop.db") as store:
         after_manual = store.current_revision
         snapshot = store.load_snapshot(action["run_id"])
@@ -1460,6 +1550,8 @@ def test_deterministic_source_failure_exhausts_frozen_route_without_retry(
     receipt = snapshot.transactions[-1]
     assert len(receipt.source_ids) == 2
     assert accepted_manual["next_action"]["effect_kind"] == "stage_complete"
+    database_bytes = (workspace / "briefloop.db").read_bytes()
+    assert all(item not in database_bytes for item in replacement_bytes)
 
     manual.write_text("mutated after acceptance\n", encoding="utf-8")
     assert (
@@ -1984,13 +2076,13 @@ def test_source_pack_commit_outcome_unknown_replays_identical_request(
         "multi_agent_brief.sources.web_search.WebSearchProvider.collect",
         one_result,
     )
-    original_submit = IntakeService.submit_source_pack
+    original_submit = IntakeService._submit_source_pack_from_host
     submit_calls = 0
 
-    def unknown_after_commit(self, request_path):
+    def unknown_after_commit(self, request, pack):
         nonlocal submit_calls
         submit_calls += 1
-        result = original_submit(self, request_path)
+        result = original_submit(self, request, pack)
         if submit_calls == 1:
             assert result.status == "committed"
             return IntakeResult(
@@ -1999,7 +2091,11 @@ def test_source_pack_commit_outcome_unknown_replays_identical_request(
             )
         return result
 
-    monkeypatch.setattr(IntakeService, "submit_source_pack", unknown_after_commit)
+    monkeypatch.setattr(
+        IntakeService,
+        "_submit_source_pack_from_host",
+        unknown_after_commit,
+    )
     with SQLiteControlStore.open(workspace / "briefloop.db") as store:
         before_revision = store.current_revision
 
