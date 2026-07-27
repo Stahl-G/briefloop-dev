@@ -107,6 +107,18 @@ class _SourcePackBytes:
     members: tuple[_SourcePackMemberBytes, ...]
 
 
+def _validate_source_pack_manifest_binding(
+    request: SourcePackCommitRequest,
+    manifest_bytes: bytes | None,
+) -> None:
+    """Reject a declared manifest mismatch before dependent member reads."""
+
+    if manifest_bytes is not None and (
+        request.expected_manifest_sha256 != sha256_hex(manifest_bytes)
+    ):
+        raise IntakeError("source_hash_mismatch")
+
+
 @dataclass(frozen=True)
 class _CoreAuthorizedSourcePack:
     """Core-derived, non-file input for the authorized atomic source writer."""
@@ -758,6 +770,7 @@ class IntakeService:
             if request.manifest_path is None
             else self._reader.read(request.manifest_path)
         )
+        _validate_source_pack_manifest_binding(request, manifest_bytes)
         payloads: list[_SourcePackMemberBytes] = []
         for member in request.members:
             proposal_bytes = self._reader.read(member.proposal_path)
@@ -808,10 +821,7 @@ class IntakeService:
         ):
             raise IntakeError("intake_request_invalid")
         manifest_bytes = pack.manifest_bytes
-        if manifest_bytes is not None and (
-            request.expected_manifest_sha256 != sha256_hex(manifest_bytes)
-        ):
-            raise IntakeError("source_hash_mismatch")
+        _validate_source_pack_manifest_binding(request, manifest_bytes)
         fingerprint_members = [
             {
                 "member_id": member.member_id,

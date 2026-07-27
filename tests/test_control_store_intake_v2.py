@@ -256,6 +256,22 @@ def _source_pack_request(
     return request, manifest, proposal, content, raw
 
 
+def _make_source_pack_member_unreadable(
+    workspace: Path,
+    request: SourcePackCommitRequest,
+    *,
+    state: str,
+    outside: Path,
+) -> None:
+    proposal_path = workspace / request.members[0].proposal_path
+    proposal_path.unlink()
+    if state == "unsafe":
+        outside.write_bytes(b'{"untrusted":"replacement"}')
+        proposal_path.symlink_to(outside)
+    elif state != "missing":
+        raise AssertionError(state)
+
+
 def _candidate_request(workspace: Path, *, expected_revision: int = 2) -> Path:
     scratch = workspace / "scratch" / "INV-SCOUT-001"
     _write_json(
@@ -890,6 +906,114 @@ def test_host_source_pack_invalid_supplied_bytes_are_typed_and_zero_write(
         snapshot = store.load_snapshot(RUN_ID)
         assert store.current_revision == 1
     assert snapshot.sources == ()
+
+
+@pytest.mark.parametrize("member_state", ["missing", "unsafe"])
+def test_public_source_pack_manifest_mismatch_precedes_member_sibling_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_state: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    request_path, _, _, _, _ = _source_pack_request(workspace)
+    request_payload = json.loads(request_path.read_bytes())
+    request_payload["expected_manifest_sha256"] = "0" * 64
+    request_path.write_text(
+        json.dumps(request_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    request = SourcePackCommitRequest.model_validate(request_payload, strict=True)
+    _make_source_pack_member_unreadable(
+        workspace,
+        request,
+        state=member_state,
+        outside=tmp_path / "outside-proposal.json",
+    )
+    service = IntakeService(workspace, clock=CLOCK)
+    original_read = service._reader.read
+    read_paths: list[str] = []
+
+    def record_read(relative_path):
+        read_paths.append(str(relative_path))
+        return original_read(relative_path)
+
+    monkeypatch.setattr(service._reader, "read", record_read)
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        before_snapshot = store.load_snapshot(RUN_ID)
+        before_revision = store.current_revision
+    before_database = (workspace / "briefloop.db").read_bytes()
+
+    result = service.submit_source_pack(
+        request_path.relative_to(workspace).as_posix()
+    )
+
+    assert result.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": "source_hash_mismatch",
+    }
+    assert read_paths == [
+        "scratch/INV-SOURCE-001/submit_request.json",
+        "scratch/INV-SOURCE-001/source_manifest.json",
+    ]
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        assert store.current_revision == before_revision
+        assert store.load_snapshot(RUN_ID) == before_snapshot
+    assert (workspace / "briefloop.db").read_bytes() == before_database
+
+
+@pytest.mark.parametrize("member_state", ["missing", "unsafe"])
+def test_public_source_pack_valid_manifest_preserves_member_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_state: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    request_path, _, _, _, _ = _source_pack_request(workspace)
+    request = SourcePackCommitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    _make_source_pack_member_unreadable(
+        workspace,
+        request,
+        state=member_state,
+        outside=tmp_path / "outside-proposal.json",
+    )
+    service = IntakeService(workspace, clock=CLOCK)
+    original_read = service._reader.read
+    read_paths: list[str] = []
+
+    def record_read(relative_path):
+        read_paths.append(str(relative_path))
+        return original_read(relative_path)
+
+    monkeypatch.setattr(service._reader, "read", record_read)
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        before_snapshot = store.load_snapshot(RUN_ID)
+        before_revision = store.current_revision
+    before_database = (workspace / "briefloop.db").read_bytes()
+
+    result = service.submit_source_pack(
+        request_path.relative_to(workspace).as_posix()
+    )
+
+    assert result.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": "scratch_entry_unsafe",
+    }
+    assert read_paths == [
+        "scratch/INV-SOURCE-001/submit_request.json",
+        "scratch/INV-SOURCE-001/source_manifest.json",
+        (
+            "scratch/INV-SOURCE-001/sources/SRC-PACK-001/"
+            "source_proposal.json"
+        ),
+    ]
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        assert store.current_revision == before_revision
+        assert store.load_snapshot(RUN_ID) == before_snapshot
+    assert (workspace / "briefloop.db").read_bytes() == before_database
 
 
 def test_host_proposal_writer_consumes_verified_bytes_without_reopening_paths(
