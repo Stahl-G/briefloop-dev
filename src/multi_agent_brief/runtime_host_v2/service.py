@@ -1197,41 +1197,18 @@ class RuntimeHostService:
         if request is None or request_payload is None:
             raise RuntimeHostError("runtime_envelope_invalid")
         lane = verified.acceptance_lane
-        request_path = materialize_host_request(
+        materialize_host_request(
             self.workspace,
             envelope,
             request_payload,
         )
-        relative_request = request_path.relative_to(self.workspace).as_posix()
-        if spec.owner_kind == "source":
-            result = IntakeService(self.workspace).submit_source(relative_request)
-        elif spec.owner_kind == "proposal":
-            if lane is None:
-                raise RuntimeHostError("runtime_envelope_invalid")
-            result = IntakeService(self.workspace).submit_proposal(
-                lane,
-                relative_request,
-            )
-        else:
-            result = ArtifactAcceptanceService(self.workspace).submit_owned_artifact(
-                request
-            )
+        result = self._submit_verified_acceptance(verified, request, lane)
         status = result.status
         if status == "commit_outcome_unknown":
             # Resolve the exact acceptance identity through the owning service
             # before refreshing action classification.  If the first commit
             # succeeded, this call returns the receipt replay for that commit.
-            if spec.owner_kind == "source":
-                result = IntakeService(self.workspace).submit_source(relative_request)
-            elif spec.owner_kind == "proposal":
-                result = IntakeService(self.workspace).submit_proposal(
-                    lane or "",
-                    relative_request,
-                )
-            else:
-                result = ArtifactAcceptanceService(
-                    self.workspace
-                ).submit_owned_artifact(request)
+            result = self._submit_verified_acceptance(verified, request, lane)
             status = result.status
             if status == "commit_outcome_unknown":
                 raise RuntimeHostError("commit_outcome_unknown")
@@ -1254,6 +1231,46 @@ class RuntimeHostService:
                 "next_action": next_action.model_dump(mode="json", exclude_unset=False),
             },
             strict=True,
+        )
+
+    def _submit_verified_acceptance(
+        self,
+        verified: _VerifiedRoleSubmission,
+        request: SourceCommitRequest
+        | ArtifactSubmitRequest
+        | OwnedArtifactSubmitRequest,
+        lane: str | None,
+    ):
+        """Delegate immutable verified bytes to the existing sole owner writer."""
+
+        if verified.spec.owner_kind == "source":
+            if not isinstance(request, SourceCommitRequest) or lane is not None:
+                raise RuntimeHostError("runtime_envelope_invalid")
+            return IntakeService(self.workspace)._submit_source_from_host(
+                request,
+                proposal_bytes=verified.outputs["source_proposal.json"],
+                content_bytes=verified.outputs["source_content.bin"],
+                raw_bytes=verified.outputs.get("source_raw.json"),
+            )
+        if verified.spec.owner_kind == "proposal":
+            if not isinstance(request, ArtifactSubmitRequest) or lane is None:
+                raise RuntimeHostError("runtime_envelope_invalid")
+            return IntakeService(self.workspace)._submit_proposal_from_host(
+                lane,
+                request,
+                verified.outputs[verified.spec.filenames[0]],
+            )
+        if (
+            verified.spec.owner_kind != "owned"
+            or not isinstance(request, OwnedArtifactSubmitRequest)
+            or lane is not None
+        ):
+            raise RuntimeHostError("runtime_envelope_invalid")
+        return ArtifactAcceptanceService(
+            self.workspace
+        )._submit_owned_artifact_from_host(
+            request,
+            verified.outputs[verified.spec.filenames[0]],
         )
 
     def _validate_envelope(self, current, envelope, spec: _RoleOutputSpec) -> None:

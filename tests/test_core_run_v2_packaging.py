@@ -293,6 +293,7 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
 
     script = textwrap.dedent(
         """
+        import hashlib
         import json
         import os
         from pathlib import Path
@@ -447,14 +448,32 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
         planner = service.continue_authorized()
         assert planner.status == "role_work_required"
         envelope_path = workspace / planner.trace.envelope_path
-        (envelope_path.parent / "source_candidates.yaml").write_text(
-            "version: 1\\ncandidates:\\n  - route: web-search\\n",
-            encoding="utf-8",
+        planner_path = envelope_path.parent / "source_candidates.yaml"
+        planner_bytes = b"version: 1\\ncandidates:\\n  - route: web-search\\n"
+        replacement_bytes = (
+            b"version: 1\\ncandidates:\\n  - route: uploaded-source\\n"
         )
+        planner_path.write_bytes(planner_bytes)
         preflight_reason = None
+        planner_sha = None
         if sys.platform != "win32":
             envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
-            accepted = service.accept_invocation(envelope["invocation_id"])
+            original_materialize_host_request = (
+                runtime_host_service.materialize_host_request
+            )
+
+            def materialize_then_replace(*args, **kwargs):
+                result = original_materialize_host_request(*args, **kwargs)
+                planner_path.write_bytes(replacement_bytes)
+                return result
+
+            runtime_host_service.materialize_host_request = materialize_then_replace
+            try:
+                accepted = service.accept_invocation(envelope["invocation_id"])
+            finally:
+                runtime_host_service.materialize_host_request = (
+                    original_materialize_host_request
+                )
             assert accepted.status == "committed"
             source_action = service.next_action()
             assert source_action.effect_kind == "source_acquire"
@@ -462,6 +481,14 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
                 head = store.load_workspace_run_head()
                 assert head is not None
                 stopped_snapshot = store.load_snapshot(head.current_run_id)
+            planner_revision = next(
+                item
+                for item in stopped_snapshot.artifact_revisions
+                if item.artifact_id == "source_candidates" and item.revision == 1
+            )
+            planner_sha = hashlib.sha256(planner_bytes).hexdigest()
+            assert planner_revision.sha256 == planner_sha
+            assert (workspace / planner_revision.path).read_bytes() == planner_bytes
 
             original_capability_profile = runtime_host_service.capability_profile
             original_known_env_key_is_set = (
@@ -569,6 +596,7 @@ def test_tavily_discovery_promotion_source_and_wheel_parity(
             result = {
                 "platform_boundary": None,
                 "source_acquire_preflight": preflight_reason,
+                "source_planner_sha256": planner_sha,
                 "provider_calls": calls,
                 "sources": [
                     {
