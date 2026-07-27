@@ -130,6 +130,7 @@ from .scratch import (
     materialize_role_envelope,
     read_role_envelope,
     read_role_outputs,
+    verify_optional_host_request,
 )
 from .submission import (
     HumanSourceStageInput,
@@ -298,6 +299,11 @@ class _VerifiedRoleSubmission:
     spec: _RoleOutputSpec
     outputs: dict[str, bytes]
     violations: tuple[FieldViolation, ...]
+    acceptance_request: (
+        SourceCommitRequest | ArtifactSubmitRequest | OwnedArtifactSubmitRequest | None
+    )
+    acceptance_lane: str | None
+    acceptance_payload: bytes | None
 
 
 class RuntimeHostService:
@@ -1186,15 +1192,15 @@ class RuntimeHostService:
         verified = self._verify_role_submission(envelope, spec)
         if verified.violations:
             raise RuntimeHostError("runtime_proposal_invalid")
-        request, lane = self._derive_acceptance_request(
-            verified.envelope,
-            verified.spec,
-            verified.outputs,
-        )
+        request = verified.acceptance_request
+        request_payload = verified.acceptance_payload
+        if request is None or request_payload is None:
+            raise RuntimeHostError("runtime_envelope_invalid")
+        lane = verified.acceptance_lane
         request_path = materialize_host_request(
             self.workspace,
             envelope,
-            canonical_json_bytes(request.model_dump(mode="json", exclude_unset=False)),
+            request_payload,
         )
         relative_request = request_path.relative_to(self.workspace).as_posix()
         if spec.owner_kind == "source":
@@ -1278,13 +1284,12 @@ class RuntimeHostService:
         )
         if invocation is None or invocation.status not in {"active", "completed"}:
             raise RuntimeHostError("runtime_envelope_invalid")
-        host_files = (
-            ("submit_request.json",) if invocation.status == "completed" else ()
-        )
+        completed = invocation.status == "completed"
         outputs = read_role_outputs(
             self.workspace,
             envelope,
-            host_filenames=host_files,
+            host_filenames=(("submit_request.json",) if completed else ()),
+            allow_optional_host_request=not completed,
         )
         violations = tuple(
             _strict_proposal_violations(
@@ -1293,11 +1298,27 @@ class RuntimeHostService:
                 expected_run_id=envelope.run_id,
             )
         )
+        request = None
+        lane = None
+        request_payload = None
+        if not violations:
+            request, lane = self._derive_acceptance_request(envelope, spec, outputs)
+            request_payload = canonical_json_bytes(
+                request.model_dump(mode="json", exclude_unset=False)
+            )
+            verify_optional_host_request(
+                self.workspace,
+                envelope,
+                request_payload,
+            )
         return _VerifiedRoleSubmission(
             envelope=envelope,
             spec=spec,
             outputs=outputs,
             violations=violations,
+            acceptance_request=request,
+            acceptance_lane=lane,
+            acceptance_payload=request_payload,
         )
 
     def _derive_acceptance_request(
@@ -1322,6 +1343,16 @@ class RuntimeHostService:
             "REQ-HOST-ACCEPT",
             envelope.invocation_id,
             envelope.action_fingerprint,
+            # Bind replay residue to the exact verified role-output bytes.
+            canonical_fingerprint(
+                [
+                    {
+                        "filename": filename,
+                        "sha256": sha256_hex(outputs[filename]),
+                    }
+                    for filename in sorted(outputs)
+                ]
+            ),
         )
         scratch = f"scratch/{envelope.invocation_id}"
         if spec.proposal_model is not None:

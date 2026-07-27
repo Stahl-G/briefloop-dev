@@ -25,6 +25,7 @@ from multi_agent_brief.control_store import (
 from multi_agent_brief.control_store.errors import ControlStoreCommitOutcomeUnknown
 from multi_agent_brief.control_store.sqlite_store import ControlStoreHistory
 from multi_agent_brief.control_store.serialization import canonical_fingerprint
+from multi_agent_brief.core_run_v2.artifacts import ArtifactAcceptanceService
 from multi_agent_brief.core_run_v2.errors import CoreRunError, CoreRunResult
 from multi_agent_brief.core_run_v2.integrity import (
     RunIntegrityService,
@@ -953,9 +954,18 @@ def test_discovery_invocation_publication_stop_is_typed_and_retry_stable(
     def forbidden_provider(*_args, **_kwargs):
         pytest.fail("provider must not run before proposal acceptance")
 
-    monkeypatch.setattr(service, "accept_invocation", unsupported_acceptance)
+    monkeypatch.setattr(
+        ArtifactAcceptanceService,
+        "submit_owned_artifact",
+        unsupported_acceptance,
+    )
     monkeypatch.setattr(WebSearchProvider, "collect", forbidden_provider)
 
+    request_path = (
+        workspace / "scratch" / active_before[0].invocation_id / "submit_request.json"
+    )
+    request_before: bytes | None = None
+    request_stat = None
     for _ in range(2):
         stopped = service.continue_authorized()
         assert stopped.status == "needs_attention"
@@ -968,16 +978,232 @@ def test_discovery_invocation_publication_stop_is_typed_and_retry_stable(
             assert head is not None
             snapshot_after = store.load_snapshot(head.current_run_id)
         assert snapshot_after == snapshot_before
-        assert tuple(
-            item for item in snapshot_after.invocations if item.status == "active"
-        ) == active_before
+        assert (
+            tuple(
+                item for item in snapshot_after.invocations if item.status == "active"
+            )
+            == active_before
+        )
+        if request_before is None:
+            request_before = request_path.read_bytes()
+            request_stat = request_path.stat()
+        else:
+            assert request_path.read_bytes() == request_before
+            replay_stat = request_path.stat()
+            assert request_stat is not None
+            assert (replay_stat.st_dev, replay_stat.st_ino) == (
+                request_stat.st_dev,
+                request_stat.st_ino,
+            )
+            assert replay_stat.st_mtime_ns == request_stat.st_mtime_ns
 
     def unrelated_failure(*_args, **_kwargs):
         raise RuntimeHostError("runtime_proposal_invalid")
 
-    monkeypatch.setattr(service, "accept_invocation", unrelated_failure)
+    monkeypatch.setattr(
+        ArtifactAcceptanceService,
+        "submit_owned_artifact",
+        unrelated_failure,
+    )
     with pytest.raises(RuntimeHostError, match="runtime_proposal_invalid"):
         service.continue_authorized()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "different",
+        "truncated",
+        "oversized",
+        "symlink",
+        "hardlink",
+        "directory",
+        "unexpected_sibling",
+    ],
+)
+def test_discovery_invocation_rejects_invalid_host_request_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    service = _service(workspace)
+    planner = service.continue_authorized()
+    assert planner.status == "role_work_required"
+    assert planner.trace.envelope_path is not None
+    scratch = (workspace / planner.trace.envelope_path).parent
+    (scratch / "source_candidates.yaml").write_text(
+        "version: 1\ncandidates:\n  - route: web-search\n",
+        encoding="utf-8",
+    )
+    action = service.next_action()
+    calls = 0
+
+    def unsupported_acceptance(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeHostError("checkout_publication_unsupported")
+
+    monkeypatch.setattr(
+        ArtifactAcceptanceService,
+        "submit_owned_artifact",
+        unsupported_acceptance,
+    )
+    stopped = service.continue_authorized()
+    assert stopped.status == "needs_attention"
+    assert stopped.reason_code == "checkout_publication_unsupported"
+    assert calls == 1
+    request_path = scratch / "submit_request.json"
+    canonical = request_path.read_bytes()
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot_before = store.load_snapshot(head.current_run_id)
+
+    if mutation == "different":
+        request_path.write_bytes(b"{}")
+    elif mutation == "truncated":
+        request_path.write_bytes(canonical[:-1])
+    elif mutation == "oversized":
+        request_path.write_bytes(b"x" * (1024 * 1024 + 1))
+    elif mutation == "symlink":
+        outside = tmp_path / "outside-request.json"
+        outside.write_bytes(canonical)
+        request_path.unlink()
+        request_path.symlink_to(outside)
+    elif mutation == "hardlink":
+        outside = tmp_path / "outside-request.json"
+        outside.write_bytes(canonical)
+        request_path.unlink()
+        os.link(outside, request_path)
+    elif mutation == "directory":
+        request_path.unlink()
+        request_path.mkdir()
+    else:
+        (scratch / "unexpected.json").write_bytes(b"unexpected")
+
+    validation = service.validate_invocation(scratch.name)
+    rejected = service.continue_authorized()
+
+    assert validation.status == "invalid"
+    assert validation.reason_code == "runtime_scratch_invalid"
+    assert rejected.status == "proposal_invalid"
+    assert rejected.reason_code == "runtime_proposal_invalid"
+    assert rejected.trace.next_action == action
+    assert rejected.trace.transaction_ids == []
+    assert calls == 1
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        assert store.load_snapshot(head.current_run_id) == snapshot_before
+
+
+def test_discovery_invocation_recreates_missing_canonical_host_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    service = _service(workspace)
+    planner = service.continue_authorized()
+    assert planner.status == "role_work_required"
+    assert planner.trace.envelope_path is not None
+    scratch = (workspace / planner.trace.envelope_path).parent
+    (scratch / "source_candidates.yaml").write_text(
+        "version: 1\ncandidates:\n  - route: web-search\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    def unsupported_acceptance(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeHostError("checkout_publication_unsupported")
+
+    monkeypatch.setattr(
+        ArtifactAcceptanceService,
+        "submit_owned_artifact",
+        unsupported_acceptance,
+    )
+    first = service.continue_authorized()
+    request_path = scratch / "submit_request.json"
+    canonical = request_path.read_bytes()
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot_before = store.load_snapshot(head.current_run_id)
+    request_path.unlink()
+
+    retried = service.continue_authorized()
+
+    assert first.status == retried.status == "needs_attention"
+    assert (
+        first.reason_code == retried.reason_code == "checkout_publication_unsupported"
+    )
+    assert first.store_revision == retried.store_revision
+    assert first.trace.next_action == retried.trace.next_action
+    assert first.trace.transaction_ids == retried.trace.transaction_ids == []
+    assert request_path.read_bytes() == canonical
+    assert calls == 2
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        assert store.load_snapshot(head.current_run_id) == snapshot_before
+
+
+def test_discovery_invocation_rejects_role_output_drift_after_host_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    service = _service(workspace)
+    planner = service.continue_authorized()
+    assert planner.status == "role_work_required"
+    assert planner.trace.envelope_path is not None
+    scratch = (workspace / planner.trace.envelope_path).parent
+    output_path = scratch / "source_candidates.yaml"
+    output_path.write_text(
+        "version: 1\ncandidates:\n  - route: web-search\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    def unsupported_acceptance(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeHostError("checkout_publication_unsupported")
+
+    monkeypatch.setattr(
+        ArtifactAcceptanceService,
+        "submit_owned_artifact",
+        unsupported_acceptance,
+    )
+    first = service.continue_authorized()
+    assert first.reason_code == "checkout_publication_unsupported"
+    request_path = scratch / "submit_request.json"
+    request_before = request_path.read_bytes()
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot_before = store.load_snapshot(head.current_run_id)
+    output_path.write_text(
+        "version: 1\ncandidates:\n  - route: web-search\n  - route: rss\n",
+        encoding="utf-8",
+    )
+
+    validation = service.validate_invocation(scratch.name)
+    rejected = service.continue_authorized()
+
+    assert validation.status == "invalid"
+    assert validation.reason_code == "runtime_scratch_invalid"
+    assert rejected.status == "proposal_invalid"
+    assert rejected.reason_code == "runtime_proposal_invalid"
+    assert rejected.trace.transaction_ids == []
+    assert request_path.read_bytes() == request_before
+    assert calls == 1
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        assert store.load_snapshot(head.current_run_id) == snapshot_before
 
 
 @_REQUIRES_RETAINED_PUBLICATION
