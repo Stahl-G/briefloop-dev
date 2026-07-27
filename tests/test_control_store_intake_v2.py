@@ -10,9 +10,11 @@ import sqlite3
 import pytest
 
 from multi_agent_brief.contracts.v2 import (
+    ArtifactSubmitRequest,
     EventEnvelope,
     Invocation,
     RunIdentity,
+    SourceCommitRequest,
     StageState,
     SourceProposal,
     WorkspaceRunHead,
@@ -22,6 +24,7 @@ from multi_agent_brief.control_store import (
     ControlStoreIntegrityError,
     SQLiteControlStore,
 )
+from multi_agent_brief.control_store.serialization import canonical_fingerprint
 from multi_agent_brief.intake_v2.errors import IntakeError, IntakeResult
 from multi_agent_brief.intake_v2.service import IntakeService
 from multi_agent_brief.intake_v2.policy import (
@@ -513,6 +516,157 @@ def test_exact_replay_returns_original_receipt_without_new_write(tmp_path: Path)
     assert replayed.receipt == committed.receipt
     with SQLiteControlStore.open(workspace / "briefloop.db") as store:
         assert store.current_revision == 2
+
+
+def test_host_source_writer_consumes_verified_bytes_without_reopening_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    request_path = _source_request(workspace)
+    request = SourceCommitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    proposal_path = request_path.parent / "source_proposal.json"
+    content_path = request_path.parent / "source_content.pdf"
+    proposal_a = proposal_path.read_bytes()
+    content_a = content_path.read_bytes()
+    content_b = b"Replacement bytes that arrived after Host verification.\n"
+    proposal_b_payload = json.loads(proposal_a)
+    proposal_b_payload["title"] = "Replacement source"
+    proposal_b_payload["content_sha256"] = hashlib.sha256(content_b).hexdigest()
+    proposal_b = json.dumps(
+        proposal_b_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    proposal_path.write_bytes(proposal_b)
+    content_path.write_bytes(content_b)
+
+    service = IntakeService(workspace, clock=CLOCK)
+    committed = service._submit_source_from_host(
+        request,
+        proposal_bytes=proposal_a,
+        content_bytes=content_a,
+        raw_bytes=None,
+    )
+    replayed = service._submit_source_from_host(
+        request,
+        proposal_bytes=proposal_a,
+        content_bytes=content_a,
+        raw_bytes=None,
+    )
+    conflict = service._submit_source_from_host(
+        request,
+        proposal_bytes=proposal_b,
+        content_bytes=content_b,
+        raw_bytes=None,
+    )
+
+    assert committed.status == "committed"
+    assert replayed.status == "replayed"
+    assert replayed.receipt == committed.receipt
+    assert conflict.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": "submission_replay_conflict",
+    }
+    expected_fingerprint = canonical_fingerprint(
+        {
+            "lane": "source",
+            "request": request.model_dump(mode="json", exclude_unset=False),
+            "proposal_sha256": hashlib.sha256(proposal_a).hexdigest(),
+            "content_sha256": hashlib.sha256(content_a).hexdigest(),
+            "raw_payload_sha256": None,
+        }
+    )
+    replacement_sha = hashlib.sha256(content_b).hexdigest()
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(RUN_ID)
+        history = store.load_history()
+        source = snapshot.sources[0]
+        assert snapshot.store_revision == 2
+        assert source.content_sha256 == hashlib.sha256(content_a).hexdigest()
+        assert source.title == "Synthetic public filing"
+        assert source.request_fingerprint == expected_fingerprint
+        source_event = next(
+            item
+            for item in snapshot.events
+            if item.intake_binding is not None
+            and item.intake_binding.source_id == source.source_id
+        )
+        assert source_event.intake_binding is not None
+        assert source_event.intake_binding.request_fingerprint == expected_fingerprint
+        assert (workspace / source.content_blob_path).read_bytes() == content_a
+        assert replacement_sha not in repr(snapshot)
+        assert replacement_sha not in repr(history.transactions)
+        assert replacement_sha.encode() not in (workspace / "briefloop.db").read_bytes()
+
+
+def test_host_proposal_writer_consumes_verified_bytes_without_reopening_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _seed_workspace(workspace)
+    service = IntakeService(workspace, clock=CLOCK)
+    source_request = _source_request(workspace).relative_to(workspace).as_posix()
+    assert service.submit_source(source_request).status == "committed"
+    request_path = _candidate_request(workspace)
+    request = ArtifactSubmitRequest.model_validate_json(
+        request_path.read_bytes(), strict=True
+    )
+    proposal_path = request_path.parent / "candidate_claims.json"
+    proposal_a = proposal_path.read_bytes()
+    proposal_b_payload = json.loads(proposal_a)
+    proposal_b_payload["candidates"][0]["statement"] = (
+        "Replacement statement written after Host verification."
+    )
+    proposal_b = json.dumps(
+        proposal_b_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    proposal_path.write_bytes(proposal_b)
+
+    committed = service._submit_proposal_from_host("candidate", request, proposal_a)
+    replayed = service._submit_proposal_from_host("candidate", request, proposal_a)
+    conflict = service._submit_proposal_from_host("candidate", request, proposal_b)
+
+    assert committed.status == "committed"
+    assert replayed.status == "replayed"
+    assert replayed.receipt == committed.receipt
+    assert conflict.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": "submission_replay_conflict",
+    }
+    expected_fingerprint = canonical_fingerprint(
+        {
+            "lane": "candidate",
+            "request": request.model_dump(mode="json", exclude_unset=False),
+            "proposal_sha256": hashlib.sha256(proposal_a).hexdigest(),
+        }
+    )
+    replacement_sha = hashlib.sha256(proposal_b).hexdigest()
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(RUN_ID)
+        history = store.load_history()
+        accepted = snapshot.accepted_proposals[0]
+        assert snapshot.store_revision == 3
+        assert accepted.proposal_sha256 == hashlib.sha256(proposal_a).hexdigest()
+        assert accepted.request_fingerprint == expected_fingerprint
+        proposal_event = next(
+            item
+            for item in snapshot.events
+            if item.intake_binding is not None
+            and item.intake_binding.proposal_id == accepted.proposal_id
+        )
+        assert proposal_event.intake_binding is not None
+        assert proposal_event.intake_binding.request_fingerprint == expected_fingerprint
+        revision = next(
+            item
+            for item in snapshot.artifact_revisions
+            if item.artifact_id == accepted.artifact_id
+            and item.revision == accepted.artifact_revision
+        )
+        assert (workspace / revision.path).read_bytes() == proposal_a
+        assert replacement_sha not in repr(snapshot)
+        assert replacement_sha not in repr(history.transactions)
+        assert replacement_sha.encode() not in (workspace / "briefloop.db").read_bytes()
 
 
 def test_invalid_trusted_candidate_records_one_failure_uow(tmp_path: Path) -> None:

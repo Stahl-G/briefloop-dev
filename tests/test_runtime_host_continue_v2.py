@@ -15,9 +15,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.test_runtime_host_codex_v2 import (
+    _advance_to_source_route,
+    _specialist_workspace,
+)
+
 from multi_agent_brief.cli.main import main
 from multi_agent_brief.contracts import SchemaRegistry
-from multi_agent_brief.contracts.v2 import CoreRunNextAction, IntegrityCheckRequest
+from multi_agent_brief.contracts.v2 import (
+    CoreRunNextAction,
+    IntegrityCheckRequest,
+    SourceCommitRequest,
+    SourceProposal,
+)
 from multi_agent_brief.control_store import (
     ControlStoreIntegrityError,
     SQLiteControlStore,
@@ -25,7 +35,7 @@ from multi_agent_brief.control_store import (
 from multi_agent_brief.control_store.errors import ControlStoreCommitOutcomeUnknown
 from multi_agent_brief.control_store.sqlite_store import ControlStoreHistory
 from multi_agent_brief.control_store.serialization import canonical_fingerprint
-from multi_agent_brief.core_run_v2.artifacts import ArtifactAcceptanceService
+from multi_agent_brief.core_run_v2 import artifacts as artifact_service
 from multi_agent_brief.core_run_v2.errors import CoreRunError, CoreRunResult
 from multi_agent_brief.core_run_v2.integrity import (
     RunIntegrityService,
@@ -43,6 +53,7 @@ from multi_agent_brief.runtime_host_v2.errors import RuntimeHostError
 from multi_agent_brief.runtime_host_v2.initialization import (
     initialize_or_open_runtime,
 )
+from multi_agent_brief.runtime_host_v2 import service as host_service
 from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
 from multi_agent_brief.runtime_host_v2.submission import source_stage_root
 from multi_agent_brief.sources.base import SourceItem
@@ -739,6 +750,48 @@ def test_discovery_authority_rejects_public_source_files_before_sibling_reads(
     assert snapshot.sources == ()
 
 
+@_REQUIRES_RETAINED_PUBLICATION
+def test_discovery_authority_rejects_generic_host_source_bytes(
+    tmp_path: Path,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    action = _advance_discovery_to_source_action(workspace)
+    current = initialize_or_open_runtime(
+        workspace,
+        adapter_loader=workspace_codex_adapter_loader(workspace),
+    )
+    dispatch = _service(workspace)._start_invocation_for_action(
+        current,
+        action,
+        role_id="source-provider",
+        request_id="REQ-HOST-GENERIC-SOURCE-GUARD",
+    )
+    request_relative = _public_source_request(
+        workspace,
+        run_id=action.run_id,
+        invocation_id=dispatch.envelope.invocation_id,
+        entrypoint="source",
+    )
+    request = SourceCommitRequest.model_validate_json(
+        (workspace / request_relative).read_bytes(),
+        strict=True,
+    )
+    before_revision = _revision(workspace)
+
+    result = IntakeService(workspace)._submit_source_from_host(
+        request,
+        proposal_bytes=b"must not be parsed",
+        content_bytes=b"must not be committed",
+        raw_bytes=b"must not be committed",
+    )
+
+    assert result.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": "source_pack_authorization_invalid",
+    }
+    assert _revision(workspace) == before_revision
+
+
 @pytest.mark.parametrize("corruption", ["missing_receipt_relation", "cross_run"])
 def test_malformed_discovery_graph_rejects_public_source_before_sibling_reads(
     tmp_path: Path,
@@ -955,8 +1008,8 @@ def test_discovery_invocation_publication_stop_is_typed_and_retry_stable(
         pytest.fail("provider must not run before proposal acceptance")
 
     monkeypatch.setattr(
-        ArtifactAcceptanceService,
-        "submit_owned_artifact",
+        artifact_service,
+        "prepare_checkout_effect",
         unsupported_acceptance,
     )
     monkeypatch.setattr(WebSearchProvider, "collect", forbidden_provider)
@@ -1001,8 +1054,8 @@ def test_discovery_invocation_publication_stop_is_typed_and_retry_stable(
         raise RuntimeHostError("runtime_proposal_invalid")
 
     monkeypatch.setattr(
-        ArtifactAcceptanceService,
-        "submit_owned_artifact",
+        artifact_service,
+        "prepare_checkout_effect",
         unrelated_failure,
     )
     with pytest.raises(RuntimeHostError, match="runtime_proposal_invalid"):
@@ -1045,8 +1098,8 @@ def test_discovery_invocation_rejects_invalid_host_request_residue(
         raise RuntimeHostError("checkout_publication_unsupported")
 
     monkeypatch.setattr(
-        ArtifactAcceptanceService,
-        "submit_owned_artifact",
+        artifact_service,
+        "prepare_checkout_effect",
         unsupported_acceptance,
     )
     stopped = service.continue_authorized()
@@ -1120,8 +1173,8 @@ def test_discovery_invocation_recreates_missing_canonical_host_request(
         raise RuntimeHostError("checkout_publication_unsupported")
 
     monkeypatch.setattr(
-        ArtifactAcceptanceService,
-        "submit_owned_artifact",
+        artifact_service,
+        "prepare_checkout_effect",
         unsupported_acceptance,
     )
     first = service.continue_authorized()
@@ -1173,8 +1226,8 @@ def test_discovery_invocation_rejects_role_output_drift_after_host_request(
         raise RuntimeHostError("checkout_publication_unsupported")
 
     monkeypatch.setattr(
-        ArtifactAcceptanceService,
-        "submit_owned_artifact",
+        artifact_service,
+        "prepare_checkout_effect",
         unsupported_acceptance,
     )
     first = service.continue_authorized()
@@ -2072,7 +2125,7 @@ def test_persistent_proposal_accept_unknown_returns_typed_attention(
     _write_current_role_proposal(workspace, required)
     monkeypatch.setattr(
         IntakeService,
-        "submit_proposal",
+        "_submit_proposal_from_host",
         lambda *_args, **_kwargs: SimpleNamespace(status="commit_outcome_unknown"),
     )
 
@@ -2090,21 +2143,25 @@ def test_committed_proposal_accept_unknown_replays_identity_before_refresh(
     required = service.continue_authorized()
     assert required.status == "role_work_required"
     _write_current_role_proposal(workspace, required)
-    original = IntakeService.submit_proposal
-    calls: list[tuple[str, str]] = []
+    original = IntakeService._submit_proposal_from_host
+    calls: list[tuple[str, bytes]] = []
     committed_transaction_id: str | None = None
 
-    def _commit_then_unknown(instance, lane, request_path):
+    def _commit_then_unknown(instance, lane, request, proposal_bytes):
         nonlocal committed_transaction_id
-        calls.append((lane, request_path))
-        result = original(instance, lane, request_path)
+        calls.append((request.request_id, proposal_bytes))
+        result = original(instance, lane, request, proposal_bytes)
         if len(calls) == 1:
             assert result.receipt is not None
             committed_transaction_id = result.receipt.transaction_id
             return SimpleNamespace(status="commit_outcome_unknown")
         return result
 
-    monkeypatch.setattr(IntakeService, "submit_proposal", _commit_then_unknown)
+    monkeypatch.setattr(
+        IntakeService,
+        "_submit_proposal_from_host",
+        _commit_then_unknown,
+    )
 
     result = service.continue_authorized()
 
@@ -2113,6 +2170,196 @@ def test_committed_proposal_accept_unknown_replays_identity_before_refresh(
     assert committed_transaction_id is not None
     assert committed_transaction_id in result.trace.transaction_ids
     assert result.status == "role_work_required"
+
+
+def test_runtime_host_proposal_acceptance_commits_pre_replacement_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _authorized_workspace(tmp_path)
+    service = _service(workspace)
+    required = service.continue_authorized()
+    assert required.status == "role_work_required"
+    _write_current_role_proposal(workspace, required)
+    assert required.trace.envelope_path is not None
+    envelope_path = workspace / required.trace.envelope_path
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    proposal_path = (
+        workspace / envelope["scratch_directory"] / "candidate_claims.json"
+    )
+    proposal_a = proposal_path.read_bytes()
+    proposal_b_payload = json.loads(proposal_a)
+    proposal_b_payload["candidates"][0]["statement"] = (
+        "Valid replacement written after RuntimeHost verification."
+    )
+    proposal_b = json.dumps(
+        proposal_b_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    original_materialize = host_service.materialize_host_request
+
+    def _materialize_then_replace(*args, **kwargs):
+        result = original_materialize(*args, **kwargs)
+        proposal_path.write_bytes(proposal_b)
+        return result
+
+    monkeypatch.setattr(
+        host_service,
+        "materialize_host_request",
+        _materialize_then_replace,
+    )
+
+    accepted = service.accept_invocation(envelope["invocation_id"])
+
+    assert accepted.status == "committed"
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(envelope["run_id"])
+        proposal = next(
+            item
+            for item in snapshot.accepted_proposals
+            if item.proposal_kind == "candidate"
+        )
+        assert proposal.proposal_sha256 == hashlib.sha256(proposal_a).hexdigest()
+        revision = next(
+            item
+            for item in snapshot.artifact_revisions
+            if item.artifact_id == proposal.artifact_id
+            and item.revision == proposal.artifact_revision
+        )
+        assert (workspace / revision.path).read_bytes() == proposal_a
+        CoreRunDomainVerifier().verify(store, envelope["run_id"])
+
+
+@_REQUIRES_RETAINED_PUBLICATION
+def test_runtime_host_owned_acceptance_commits_pre_replacement_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    service = _service(workspace)
+    required = service.continue_authorized()
+    assert required.status == "role_work_required"
+    assert required.trace.envelope_path is not None
+    envelope_path = workspace / required.trace.envelope_path
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    proposal_path = workspace / envelope["scratch_directory"] / "source_candidates.yaml"
+    proposal_a = b"version: 1\ncandidates:\n  - route: web-search\n"
+    proposal_b = b"version: 1\ncandidates:\n  - route: uploaded-source\n"
+    proposal_path.write_bytes(proposal_a)
+    original_materialize = host_service.materialize_host_request
+
+    def _materialize_then_replace(*args, **kwargs):
+        result = original_materialize(*args, **kwargs)
+        proposal_path.write_bytes(proposal_b)
+        return result
+
+    monkeypatch.setattr(
+        host_service,
+        "materialize_host_request",
+        _materialize_then_replace,
+    )
+
+    accepted = service.accept_invocation(envelope["invocation_id"])
+
+    assert accepted.status == "committed"
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(envelope["run_id"])
+        revision = next(
+            item
+            for item in snapshot.artifact_revisions
+            if item.artifact_id == "source_candidates" and item.revision == 1
+        )
+        assert revision.sha256 == hashlib.sha256(proposal_a).hexdigest()
+        assert (workspace / revision.path).read_bytes() == proposal_a
+        CoreRunDomainVerifier().verify(store, envelope["run_id"])
+
+
+def test_runtime_host_source_acceptance_commits_pre_replacement_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    if sys.platform == "win32":
+        pytest.skip("source-candidate publication is precommit unsupported on Windows")
+    workspace = _specialist_workspace(tmp_path)
+    host, action = _advance_to_source_route(workspace, capsys, route="rss")
+    dispatch = host.start_current_invocation(expected_action=action)
+    scratch = workspace / dispatch.envelope.scratch_directory
+    content_a = b"Exact source bytes verified by RuntimeHost.\n"
+    raw_a = b'{"provider":"rss","result":"verified-a"}\n'
+    proposal_a_payload = SchemaRegistry.example(SourceProposal.schema_id, "full")
+    proposal_a_payload.update(
+        proposal_id="PROP-SOURCE-RSS-HOST-A",
+        run_id=action.run_id,
+        source_id="SRC-RSS-HOST-A",
+        title="Verified source A",
+        content_sha256=hashlib.sha256(content_a).hexdigest(),
+        raw_payload_sha256=hashlib.sha256(raw_a).hexdigest(),
+    )
+    proposal_a = json.dumps(
+        proposal_a_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    proposal_path = scratch / "source_proposal.json"
+    content_path = scratch / "source_content.bin"
+    raw_path = scratch / "source_raw.json"
+    proposal_path.write_bytes(proposal_a)
+    content_path.write_bytes(content_a)
+    raw_path.write_bytes(raw_a)
+
+    content_b = b"Valid replacement source bytes after Host verification.\n"
+    raw_b = b'{"provider":"rss","result":"replacement-b"}\n'
+    proposal_b_payload = deepcopy(proposal_a_payload)
+    proposal_b_payload.update(
+        title="Replacement source B",
+        content_sha256=hashlib.sha256(content_b).hexdigest(),
+        raw_payload_sha256=hashlib.sha256(raw_b).hexdigest(),
+    )
+    proposal_b = json.dumps(
+        proposal_b_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    original_materialize = host_service.materialize_host_request
+
+    def _materialize_then_replace(*args, **kwargs):
+        result = original_materialize(*args, **kwargs)
+        proposal_path.write_bytes(proposal_b)
+        content_path.write_bytes(content_b)
+        raw_path.write_bytes(raw_b)
+        return result
+
+    monkeypatch.setattr(
+        host_service,
+        "materialize_host_request",
+        _materialize_then_replace,
+    )
+
+    accepted = host.accept_invocation(dispatch.envelope.invocation_id)
+
+    assert accepted.status == "committed"
+    replacement_hashes = {
+        hashlib.sha256(proposal_b).hexdigest(),
+        hashlib.sha256(content_b).hexdigest(),
+        hashlib.sha256(raw_b).hexdigest(),
+    }
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(action.run_id)
+        history = store.load_history()
+        source = next(
+            item for item in snapshot.sources if item.source_id == "SRC-RSS-HOST-A"
+        )
+        assert source.title == "Verified source A"
+        assert source.content_sha256 == hashlib.sha256(content_a).hexdigest()
+        assert source.raw_payload_sha256 == hashlib.sha256(raw_a).hexdigest()
+        assert (workspace / source.content_blob_path).read_bytes() == content_a
+        assert source.raw_payload_blob_path is not None
+        assert (workspace / source.raw_payload_blob_path).read_bytes() == raw_a
+        CoreRunDomainVerifier().verify(store, action.run_id)
+        for replacement_hash in replacement_hashes:
+            assert replacement_hash not in repr(snapshot)
+            assert replacement_hash not in repr(history.transactions)
+            assert replacement_hash.encode() not in (
+                workspace / "briefloop.db"
+            ).read_bytes()
 
 
 def test_finalize_effect_suppresses_legacy_hook_then_presents_terminal(

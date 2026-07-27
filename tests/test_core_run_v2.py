@@ -1290,6 +1290,77 @@ def test_input_classification_exact_replay_precedes_current_input_scan(
     assert _store_revision(workspace) == committed_revision
 
 
+def test_host_owned_writer_consumes_verified_bytes_without_reopening_path(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    _advance_to_input_governance_ready(workspace)
+    scratch = workspace / "scratch" / "input-governance-v2"
+    scratch.mkdir(parents=True, exist_ok=True)
+    candidate = scratch / "input_classification.json"
+    content_a = _input_classification_bytes(workspace)
+    candidate.write_bytes(content_a)
+    request = _record(
+        OwnedArtifactSubmitRequest,
+        request_id="REQ-INPUT-GOV-HOST-BYTES",
+        run_id=RUN_ID,
+        artifact_id="input_classification",
+        invocation_id=None,
+        producer_tool_id="input-governance-v2",
+        input_path=candidate.relative_to(workspace).as_posix(),
+        expected_store_revision=_store_revision(workspace),
+        expected_artifact_revision=0,
+        expected_parent_artifact=None,
+    )
+    content_b = b'{"replacement":"after-host-verification"}'
+    candidate.write_bytes(content_b)
+    service = ArtifactAcceptanceService(workspace, clock=CLOCK)
+
+    committed = service._submit_owned_artifact_from_host(request, content_a)
+    replayed = service._submit_owned_artifact_from_host(request, content_a)
+    conflict = service._submit_owned_artifact_from_host(request, content_b)
+
+    assert committed.status == "committed", committed.to_dict()
+    assert replayed.status == "replayed"
+    assert replayed.receipt == committed.receipt
+    assert conflict.to_dict() == {
+        "status": "failed_uncommitted",
+        "error_code": "submission_replay_conflict",
+    }
+    expected_fingerprint = canonical_fingerprint(
+        request.model_dump(mode="json", exclude_unset=False)
+    )
+    replacement_sha = sha256_hex(content_b)
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        snapshot = store.load_snapshot(RUN_ID)
+        history = store.load_history()
+        revision = next(
+            item
+            for item in snapshot.artifact_revisions
+            if item.artifact_id == "input_classification" and item.revision == 1
+        )
+        assert revision.sha256 == sha256_hex(content_a)
+        assert (workspace / revision.path).read_bytes() == content_a
+        submission = next(
+            item
+            for item in snapshot.owned_artifact_submissions
+            if item.submission_id == committed.primary_record_id
+        )
+        assert submission.artifact_sha256 == sha256_hex(content_a)
+        assert submission.request_fingerprint == expected_fingerprint
+        event = next(
+            item
+            for item in snapshot.events
+            if item.core_run_binding is not None
+            and item.core_run_binding.primary_record_id == submission.submission_id
+        )
+        assert event.core_run_binding is not None
+        assert event.core_run_binding.request_fingerprint == expected_fingerprint
+        assert replacement_sha not in repr(snapshot)
+        assert replacement_sha not in repr(history.transactions)
+        assert replacement_sha.encode() not in (workspace / "briefloop.db").read_bytes()
+
+
 def test_input_classification_identity_is_workspace_relative_and_selector_stable(
     tmp_path: Path,
 ) -> None:

@@ -79,6 +79,20 @@ class ArtifactAcceptanceService:
         except (CoreRunError, ControlStoreError) as exc:
             return core_run_failure_result(exc)
 
+    def _submit_owned_artifact_from_host(
+        self,
+        request: OwnedArtifactSubmitRequest,
+        content: bytes,
+    ) -> CoreRunResult:
+        """Accept immutable RuntimeHost-verified bytes through this sole writer."""
+
+        try:
+            if type(content) is not bytes:
+                raise CoreRunError("artifact_input_unsafe")
+            return self._submit_owned_artifact(request, host_content=content)
+        except (CoreRunError, ControlStoreError) as exc:
+            return core_run_failure_result(exc)
+
     def promote_audit_proposal(
         self,
         request: AuditPromotionRequest,
@@ -91,6 +105,8 @@ class ArtifactAcceptanceService:
     def _submit_owned_artifact(
         self,
         request: OwnedArtifactSubmitRequest,
+        *,
+        host_content: bytes | None = None,
     ) -> CoreRunResult:
         policy = ARTIFACT_POLICIES.get(request.artifact_id)
         if policy is None:
@@ -106,6 +122,17 @@ class ArtifactAcceptanceService:
                 request_fingerprint=fingerprint,
             )
             if replay is not None:
+                if host_content is not None:
+                    snapshot = store.load_snapshot(request.run_id)
+                    submissions = [
+                        item
+                        for item in snapshot.owned_artifact_submissions
+                        if item.submission_id == replay.primary_record_id
+                    ]
+                    if len(submissions) != 1:
+                        raise CoreRunError("control_store_integrity_invalid")
+                    if submissions[0].artifact_sha256 != sha256_hex(host_content):
+                        raise CoreRunError("submission_replay_conflict")
                 return replay
             if PurePosixPath(request.input_path).suffix != policy.input_suffix:
                 raise CoreRunError("artifact_input_unsafe")
@@ -115,10 +142,13 @@ class ArtifactAcceptanceService:
                 and verified.snapshot.run_execution_authorizations
             ):
                 raise CoreRunError("artifact_owner_mismatch")
-            try:
-                content = self._reader.read(request.input_path)
-            except IntakeError as exc:
-                raise CoreRunError("artifact_input_unsafe") from exc
+            if host_content is None:
+                try:
+                    content = self._reader.read(request.input_path)
+                except IntakeError as exc:
+                    raise CoreRunError("artifact_input_unsafe") from exc
+            else:
+                content = host_content
             if request.artifact_id == "input_classification":
                 expected_content = _input_classification_bytes(self.workspace)
                 if content != expected_content:

@@ -144,6 +144,43 @@ class IntakeService:
         except IntakeError as exc:
             return IntakeResult(status="failed_uncommitted", error_code=exc.code)
 
+    def _submit_source_from_host(
+        self,
+        request: SourceCommitRequest,
+        *,
+        proposal_bytes: bytes,
+        content_bytes: bytes,
+        raw_bytes: bytes | None,
+    ) -> IntakeResult:
+        """Accept immutable RuntimeHost-verified source bytes through this sole writer."""
+
+        try:
+            if (
+                type(proposal_bytes) is not bytes
+                or type(content_bytes) is not bytes
+                or (raw_bytes is not None and type(raw_bytes) is not bytes)
+            ):
+                raise IntakeError("intake_request_invalid")
+            with self._open_store() as store:
+                self._reject_authorized_source_file_entrypoint(
+                    store,
+                    request.run_id,
+                    request.request_id,
+                )
+            return self._submit_source_bytes(
+                request,
+                proposal_bytes=proposal_bytes,
+                content_bytes=content_bytes,
+                raw_bytes=raw_bytes,
+            )
+        except ControlStoreCommitOutcomeUnknown:
+            return IntakeResult(
+                status="commit_outcome_unknown",
+                error_code="commit_outcome_unknown",
+            )
+        except IntakeError as exc:
+            return IntakeResult(status="failed_uncommitted", error_code=exc.code)
+
     def submit_source_pack(self, request_path: str | os.PathLike[str]) -> IntakeResult:
         """Validate and atomically commit every member of one source pack."""
 
@@ -423,6 +460,32 @@ class IntakeService:
         except IntakeError as exc:
             return IntakeResult(status="failed_uncommitted", error_code=exc.code)
 
+    def _submit_proposal_from_host(
+        self,
+        lane: str,
+        request: ArtifactSubmitRequest,
+        proposal_bytes: bytes,
+    ) -> IntakeResult:
+        """Accept immutable RuntimeHost-verified proposal bytes through this sole writer."""
+
+        try:
+            if lane not in INTAKE_LANES or lane == "source":
+                raise IntakeError("intake_request_invalid")
+            if type(proposal_bytes) is not bytes:
+                raise IntakeError("intake_request_invalid")
+            return self._submit_proposal_bytes(
+                INTAKE_LANES[lane],
+                request,
+                proposal_bytes,
+            )
+        except ControlStoreCommitOutcomeUnknown:
+            return IntakeResult(
+                status="commit_outcome_unknown",
+                error_code="commit_outcome_unknown",
+            )
+        except IntakeError as exc:
+            return IntakeResult(status="failed_uncommitted", error_code=exc.code)
+
     def fail_invocation(self, request: InvocationFailureRequest) -> IntakeResult:
         """Record one finite host failure for an already-authoritative invocation."""
 
@@ -512,6 +575,21 @@ class IntakeService:
             if request.raw_payload_path is None
             else self._reader.read(request.raw_payload_path)
         )
+        return self._submit_source_bytes(
+            request,
+            proposal_bytes=proposal_bytes,
+            content_bytes=content_bytes,
+            raw_bytes=raw_bytes,
+        )
+
+    def _submit_source_bytes(
+        self,
+        request: SourceCommitRequest,
+        *,
+        proposal_bytes: bytes,
+        content_bytes: bytes,
+        raw_bytes: bytes | None,
+    ) -> IntakeResult:
         request_fingerprint = canonical_fingerprint(
             {
                 "lane": "source",
@@ -879,6 +957,14 @@ class IntakeService:
     ) -> IntakeResult:
         request = self._read_request(ArtifactSubmitRequest, request_path)
         proposal_bytes = self._reader.read(request.input_path)
+        return self._submit_proposal_bytes(lane, request, proposal_bytes)
+
+    def _submit_proposal_bytes(
+        self,
+        lane: LanePolicy,
+        request: ArtifactSubmitRequest,
+        proposal_bytes: bytes,
+    ) -> IntakeResult:
         request_fingerprint = canonical_fingerprint(
             {
                 "lane": lane.lane,
