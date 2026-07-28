@@ -98,17 +98,22 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
 
     script = textwrap.dedent(
         """
+        import http.client
         import json
         from pathlib import Path
         import sqlite3
+        import stat
         import sys
+        from urllib.parse import parse_qs, urlsplit
 
         import multi_agent_brief
         from multi_agent_brief.control_store import SQLiteControlStore
-        from multi_agent_brief.product.init_web.submit import (
-            SUBMISSION_SCHEMA,
-            InitWebSubmitter,
+        from multi_agent_brief.core.env import get_known_env_value
+        from multi_agent_brief.product.init_web.server import (
+            SESSION_TOKEN_HEADER,
+            create_init_web_server,
         )
+        from multi_agent_brief.product.init_web.submit import InitWebSubmitter
         from multi_agent_brief.runtime_host_v2.codex import (
             workspace_codex_adapter_loader,
         )
@@ -129,62 +134,124 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
             "package root mismatch",
         )
 
+        provider_calls = []
+
         def _provider_must_not_run(*_args, **_kwargs):
+            provider_calls.append(True)
             raise AssertionError("provider must not run in 1A")
+
+        def credentials(url):
+            fragment = parse_qs(urlsplit(url).fragment)
+            return fragment["token"][0], fragment["session"][0]
+
+        def post_json(server, token, session_id, path, payload):
+            connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+            try:
+                connection.request(
+                    "POST",
+                    f"{path}?session_id={session_id}",
+                    body=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        SESSION_TOKEN_HEADER: token,
+                    },
+                )
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        def public_web_body(session_id, task_objective="Prepare a packaged discovery brief."):
+            return {
+                "schema_version": "briefloop.init_web.submission.v1",
+                "request_id": "REQ-WHEEL-DISCOVERY-001",
+                "payload": {
+                    "workspace_target": "workspace",
+                    "selections": {
+                        "company": "Wheel ExampleCo",
+                        "industry_or_theme": "manufacturing",
+                        "task_objective": task_objective,
+                        "brief_title": "Wheel discovery brief",
+                        "audience": "management",
+                        "interface_language": "en",
+                        "output_language": "en",
+                        "cadence": "weekly",
+                        "focus_areas": ["operations"],
+                        "output_formats": ["markdown"],
+                        "forbidden_sources": [],
+                        "source_profile": "llm_decide",
+                        "web_search_mode": "external_api",
+                        "search_backend": "tavily",
+                        "output_extent": "balanced",
+                    },
+                    "completion_target": "finalized_local",
+                    "repair_budget": 1,
+                    "search_secret_session_id": session_id,
+                    "human_confirmation": True,
+                },
+            }
 
         WebSearchProvider.collect = _provider_must_not_run
         sentinel = "tvly-wheel-discovery-sentinel"
-        submitter = InitWebSubmitter(base_dir=base)
-        configured = submitter.configure_search_secret(
-            session_id="wheel-discovery-session",
-            body={"provider": "tavily", "api_key": sentinel},
+        response_bytes = []
+        first_server = create_init_web_server(
+            InitWebSubmitter(base_dir=base), exit_on_success=False
         )
-        require(configured["configured"] is True, "secret configuration failed")
-        body = {
-            "schema_version": SUBMISSION_SCHEMA,
-            "request_id": "REQ-WHEEL-DISCOVERY-001",
-            "payload": {
-                "workspace_target": "workspace",
-                "selections": {
-                    "company": "Wheel ExampleCo",
-                    "industry_or_theme": "manufacturing",
-                    "task_objective": "Prepare a packaged discovery brief.",
-                    "brief_title": "Wheel discovery brief",
-                    "audience": "management",
-                    "interface_language": "en",
-                    "output_language": "en",
-                    "cadence": "weekly",
-                    "focus_areas": ["operations"],
-                    "output_formats": ["markdown"],
-                    "forbidden_sources": [],
-                    "source_profile": "llm_decide",
-                    "web_search_mode": "external_api",
-                    "search_backend": "tavily",
-                    "output_extent": "balanced",
-                },
-                "completion_target": "finalized_local",
-                "repair_budget": 1,
-                "search_secret_session_id": "wheel-discovery-session",
-                "human_confirmation": True,
-            },
-        }
-        status, first = submitter.submit(body)
-        require(status == 200, "initial submission failed")
-        require(first["status"] == "committed", "initial status mismatch")
-        require(first["execution_authorized"] is False, "execution authority leaked")
-        require(
-            first["source_discovery_authorized"] is True,
-            "discovery authority missing",
-        )
-        require(first["search_secret_status"] == "ready", "secret status mismatch")
-        require(sentinel not in json.dumps(first), "secret leaked in response")
+        first_server.start()
+        try:
+            token, session_id = credentials(first_server.url)
+            status, raw = post_json(
+                first_server,
+                token,
+                session_id,
+                "/api/v1/search-secret",
+                {"provider": "tavily", "api_key": sentinel},
+            )
+            response_bytes.append(raw)
+            require(status == 200, "secret endpoint failed")
+            status, raw = post_json(
+                first_server,
+                token,
+                session_id,
+                "/api/v1/submit",
+                public_web_body(session_id),
+            )
+            response_bytes.append(raw)
+            require(status == 200, "initial loopback submission failed")
+            first = json.loads(raw)
+            require(first["status"] == "committed", "initial status mismatch")
+            require(first["execution_authorized"] is False, "execution authority leaked")
+            require(
+                first["source_discovery_authorized"] is True,
+                "discovery authority missing",
+            )
+            require(first["search_secret_status"] == "ready", "secret status mismatch")
+            require(first_server.outcome is not None, "loopback outcome missing")
+            require(
+                first_server.outcome.source_discovery_authorized is True,
+                "loopback outcome lost discovery authority",
+            )
+        finally:
+            first_server.close()
+
         workspace = base / "workspace"
         db_path = workspace / "briefloop.db"
+        env_path = workspace / ".env"
+        require(env_path.is_file(), "workspace env missing")
+        require(stat.S_IMODE(env_path.stat().st_mode) == 0o600, "workspace env mode")
+        require(
+            get_known_env_value("TAVILY_API_KEY", workspace) == sentinel,
+            "workspace env value mismatch",
+        )
         db_bytes = db_path.read_bytes()
         with SQLiteControlStore.open(db_path) as store:
             head = store.load_workspace_run_head()
             require(head is not None, "workspace head missing")
             snapshot = store.load_snapshot(head.current_run_id)
+            receipt = store.load_transaction_receipt(
+                head.current_run_id,
+                first["transaction_id"],
+            )
         require(
             len(snapshot.run_execution_authorizations) == 0,
             "execution authorization was created",
@@ -193,8 +260,15 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
             len(snapshot.run_source_discovery_authorizations) == 1,
             "discovery authorization missing",
         )
+        require(len(receipt.run_source_discovery_authorizations) == 1, "receipt relation")
         require(not snapshot.sources, "sources were acquired")
         require(sentinel.encode("utf-8") not in db_bytes, "secret leaked in Store")
+        for artifact in workspace.rglob("*"):
+            if artifact.is_file() and artifact != env_path:
+                require(
+                    sentinel.encode("utf-8") not in artifact.read_bytes(),
+                    "secret leaked in artifact",
+                )
         with sqlite3.connect(db_path) as connection:
             require(
                 connection.execute("PRAGMA user_version").fetchone()[0] == 9,
@@ -212,11 +286,148 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
         )
         require(continuation.trace.transaction_ids == [], "continuation wrote Store")
         require(db_path.read_bytes() == db_bytes, "continuation changed Store")
-        replay_status, replay = submitter.submit(body)
-        require(replay_status == 200, "replay failed")
-        require(replay["status"] == "replayed", "replay status mismatch")
-        require(replay["search_secret_status"] == "ready", "replay secret mismatch")
-        require(db_path.read_bytes() == db_bytes, "replay changed Store")
+        initial_env_mtime = env_path.stat().st_mtime_ns
+
+        ready_server = create_init_web_server(
+            InitWebSubmitter(base_dir=base), exit_on_success=False
+        )
+        ready_server.start()
+        try:
+            token, session_id = credentials(ready_server.url)
+            status, raw = post_json(
+                ready_server,
+                token,
+                session_id,
+                "/api/v1/submit",
+                public_web_body(session_id),
+            )
+            response_bytes.append(raw)
+            require(status == 200, "ready replay failed")
+            ready = json.loads(raw)
+            require(ready["status"] == "replayed", "ready replay status")
+            require(ready["search_secret_status"] == "ready", "ready replay secret")
+        finally:
+            ready_server.close()
+        require(env_path.stat().st_mtime_ns == initial_env_mtime, "ready replay rewrote env")
+        require(db_path.read_bytes() == db_bytes, "ready replay changed Store")
+
+        env_path.unlink()
+        missing_server = create_init_web_server(
+            InitWebSubmitter(base_dir=base), exit_on_success=False
+        )
+        missing_server.start()
+        try:
+            token, session_id = credentials(missing_server.url)
+            status, raw = post_json(
+                missing_server,
+                token,
+                session_id,
+                "/api/v1/submit",
+                public_web_body(session_id),
+            )
+            response_bytes.append(raw)
+            missing = json.loads(raw)
+            require(status == 422, "missing credential status")
+            require(
+                missing["reason_code"] == "submission_search_api_key_required",
+                "missing credential reason",
+            )
+        finally:
+            missing_server.close()
+        require(not env_path.exists(), "missing credential wrote env")
+        require(db_path.read_bytes() == db_bytes, "missing credential changed Store")
+
+        recovery_submitter = InitWebSubmitter(base_dir=base)
+        recovery_server = create_init_web_server(
+            recovery_submitter, exit_on_success=False
+        )
+        recovery_server.start()
+        try:
+            token, session_id = credentials(recovery_server.url)
+            status, raw = post_json(
+                recovery_server,
+                token,
+                session_id,
+                "/api/v1/search-secret",
+                {"provider": "tavily", "api_key": sentinel},
+            )
+            response_bytes.append(raw)
+            require(status == 200, "recovery secret endpoint")
+            status, raw = post_json(
+                recovery_server,
+                token,
+                session_id,
+                "/api/v1/submit",
+                public_web_body(session_id),
+            )
+            response_bytes.append(raw)
+            recovered = json.loads(raw)
+            require(status == 200, "recovery replay failed")
+            require(recovered["status"] == "replayed", "recovery replay status")
+            require(
+                recovered["search_secret_status"] == "recovered",
+                "recovery secret status",
+            )
+            require(env_path.is_file(), "recovery did not write env")
+            require(stat.S_IMODE(env_path.stat().st_mode) == 0o600, "recovery env mode")
+            require(
+                get_known_env_value("TAVILY_API_KEY", workspace) == sentinel,
+                "recovery env value",
+            )
+            recovered_env_mtime = env_path.stat().st_mtime_ns
+            require(db_path.read_bytes() == db_bytes, "recovery changed Store")
+
+            status, raw = post_json(
+                recovery_server,
+                token,
+                session_id,
+                "/api/v1/submit",
+                public_web_body(session_id),
+            )
+            response_bytes.append(raw)
+            require(status == 200, "exact retry failed")
+            require(
+                json.loads(raw)["search_secret_status"] == "ready",
+                "exact retry secret status",
+            )
+            require(
+                env_path.stat().st_mtime_ns == recovered_env_mtime,
+                "exact retry rewrote env",
+            )
+
+            env_path.unlink()
+
+            def secret_effect_must_not_run(**_kwargs):
+                raise AssertionError("semantic conflict must precede credential effect")
+
+            recovery_submitter._apply_search_secret_effect = secret_effect_must_not_run
+            status, raw = post_json(
+                recovery_server,
+                token,
+                session_id,
+                "/api/v1/submit",
+                public_web_body(
+                    session_id,
+                    task_objective="Prepare a changed packaged discovery brief.",
+                ),
+            )
+            response_bytes.append(raw)
+            conflict = json.loads(raw)
+            require(status == 409, "semantic conflict status")
+            require(
+                conflict["reason_code"] == "submission_replay_conflict",
+                "semantic conflict reason",
+            )
+        finally:
+            recovery_server.close()
+
+        require(not env_path.exists(), "semantic conflict wrote env")
+        require(db_path.read_bytes() == db_bytes, "semantic conflict changed Store")
+        require(not provider_calls, "provider was called")
+        require(
+            all(sentinel.encode("utf-8") not in raw for raw in response_bytes),
+            "secret leaked in response",
+        )
         print(json.dumps({
             "optimize": sys.flags.optimize,
             "schema_version": snapshot.run_source_discovery_authorizations[0].schema_version,
@@ -228,8 +439,11 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
             "continuation_status": continuation.status,
             "continuation_reason": continuation.reason_code,
             "continuation_effect": continuation.trace.next_action.effect_kind,
-            "replay_status": replay["status"],
-            "secret_status": replay["search_secret_status"],
+            "ready_replay_status": ready["search_secret_status"],
+            "missing_reason": missing["reason_code"],
+            "recovered_status": recovered["search_secret_status"],
+            "conflict_reason": conflict["reason_code"],
+            "provider_calls": len(provider_calls),
         }, sort_keys=True))
         """
     )

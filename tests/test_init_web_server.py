@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
+import stat
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from multi_agent_brief.control_store import SQLiteControlStore
+from multi_agent_brief.core.env import get_known_env_value
 from multi_agent_brief.product.init_web.server import (
     MAX_JSON_BODY_BYTES,
     SESSION_TOKEN_HEADER,
@@ -19,6 +23,9 @@ from multi_agent_brief.product.init_web.submit import (
     InitWebSubmitter,
     SubmissionError,
 )
+from multi_agent_brief.runtime_host_v2.codex import workspace_codex_adapter_loader
+from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
+from multi_agent_brief.sources.web_search import WebSearchProvider
 
 
 class _StubSubmitter:
@@ -130,6 +137,61 @@ def _submit_body(request_id: str = "REQ-TEST01") -> bytes:
             "payload": {"workspace_target": "./ws", "human_confirmation": True},
         }
     ).encode("utf-8")
+
+
+def _public_web_tavily_body(
+    *,
+    request_id: str,
+    session_id: str,
+    workspace_target: str,
+    task_objective: str = "Prepare the weekly manufacturing brief.",
+) -> dict[str, object]:
+    return {
+        "schema_version": "briefloop.init_web.submission.v1",
+        "request_id": request_id,
+        "payload": {
+            "workspace_target": workspace_target,
+            "selections": {
+                "company": "Loopback ExampleCo",
+                "industry_or_theme": "manufacturing",
+                "task_objective": task_objective,
+                "brief_title": "Loopback discovery brief",
+                "audience": "management",
+                "interface_language": "en",
+                "output_language": "en",
+                "cadence": "weekly",
+                "focus_areas": ["operations"],
+                "output_formats": ["markdown"],
+                "forbidden_sources": [],
+                "source_profile": "llm_decide",
+                "web_search_mode": "external_api",
+                "search_backend": "tavily",
+                "output_extent": "balanced",
+            },
+            "completion_target": "finalized_local",
+            "repair_budget": 1,
+            "search_secret_session_id": session_id,
+            "human_confirmation": True,
+        },
+    }
+
+
+def _post_json(
+    server,
+    *,
+    token: str,
+    session_id: str,
+    path: str,
+    body: dict[str, object],
+) -> tuple[int, bytes]:
+    status, _headers, raw = _request(
+        server,
+        "POST",
+        f"{path}?session_id={session_id}",
+        body=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", SESSION_TOKEN_HEADER: token},
+    )
+    return status, raw
 
 
 @pytest.fixture()
@@ -377,6 +439,253 @@ def test_public_web_success_reports_pre_provider_discovery_authorization() -> No
         )
     finally:
         instance.close()
+
+
+def test_real_loopback_public_web_tavily_replays_before_credential_or_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_calls: list[object] = []
+
+    def _provider_must_not_run(*args: object, **kwargs: object) -> None:
+        provider_calls.append((args, kwargs))
+        raise AssertionError("provider must not run in 1A")
+
+    monkeypatch.setattr(WebSearchProvider, "collect", _provider_must_not_run)
+    sentinel = "tvly-loopback-discovery-sentinel"
+    request_id = "REQ-LOOPBACK-DISCOVERY-001"
+    workspace_target = "loopback-discovery"
+    response_bytes: list[bytes] = []
+
+    first = create_init_web_server(
+        InitWebSubmitter(base_dir=tmp_path), exit_on_success=False
+    )
+    first.start()
+    try:
+        token, session_id = _credentials(first.url)
+        status, raw = _post_json(
+            first,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/search-secret",
+            body={"provider": "tavily", "api_key": sentinel},
+        )
+        response_bytes.append(raw)
+        assert status == 200
+        assert json.loads(raw) == {
+            "api_key_env": "TAVILY_API_KEY",
+            "configured": True,
+            "ok": True,
+            "provider": "tavily",
+        }
+        status, raw = _post_json(
+            first,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/submit",
+            body=_public_web_tavily_body(
+                request_id=request_id,
+                session_id=session_id,
+                workspace_target=workspace_target,
+            ),
+        )
+        response_bytes.append(raw)
+        assert status == 200
+        first_payload = json.loads(raw)
+        assert first_payload["status"] == "committed"
+        assert first_payload["execution_authorized"] is False
+        assert first_payload["source_discovery_authorized"] is True
+        assert first_payload["search_secret_status"] == "ready"
+        assert first.outcome is not None
+        assert first.outcome.execution_authorized is False
+        assert first.outcome.source_discovery_authorized is True
+        assert "workspace" not in first_payload
+        assert "receipt" not in first_payload
+    finally:
+        first.close()
+
+    workspace = tmp_path / workspace_target
+    db_path = workspace / "briefloop.db"
+    env_path = workspace / ".env"
+    assert db_path.is_file()
+    assert env_path.is_file()
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    assert get_known_env_value("TAVILY_API_KEY", workspace) == sentinel
+    db_bytes = db_path.read_bytes()
+    with SQLiteControlStore.open(db_path) as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot = store.load_snapshot(head.current_run_id)
+        receipt = store.load_transaction_receipt(
+            head.current_run_id,
+            first_payload["transaction_id"],
+        )
+    assert len(snapshot.run_execution_authorizations) == 0
+    assert len(snapshot.run_source_discovery_authorizations) == 1
+    assert snapshot.sources == ()
+    assert receipt is not None
+    assert len(receipt.run_source_discovery_authorizations) == 1
+    assert snapshot.store_revision == 1
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    for artifact in workspace.rglob("*"):
+        if artifact.is_file() and artifact != env_path:
+            assert sentinel.encode("utf-8") not in artifact.read_bytes()
+
+    continuation = RuntimeHostService(
+        workspace,
+        adapter_loader=workspace_codex_adapter_loader(workspace),
+    ).continue_authorized()
+    assert continuation.status == "needs_attention"
+    assert continuation.reason_code == "automatic_source_acquisition_not_yet_available"
+    assert continuation.trace.transaction_ids == []
+    assert db_path.read_bytes() == db_bytes
+    initial_env_mtime = env_path.stat().st_mtime_ns
+
+    ready = create_init_web_server(
+        InitWebSubmitter(base_dir=tmp_path), exit_on_success=False
+    )
+    ready.start()
+    try:
+        token, session_id = _credentials(ready.url)
+        status, raw = _post_json(
+            ready,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/submit",
+            body=_public_web_tavily_body(
+                request_id=request_id,
+                session_id=session_id,
+                workspace_target=workspace_target,
+            ),
+        )
+        response_bytes.append(raw)
+        assert status == 200
+        ready_payload = json.loads(raw)
+        assert ready_payload["status"] == "replayed"
+        assert ready_payload["search_secret_status"] == "ready"
+    finally:
+        ready.close()
+    assert env_path.stat().st_mtime_ns == initial_env_mtime
+    assert db_path.read_bytes() == db_bytes
+
+    env_path.unlink()
+    missing = create_init_web_server(
+        InitWebSubmitter(base_dir=tmp_path), exit_on_success=False
+    )
+    missing.start()
+    try:
+        token, session_id = _credentials(missing.url)
+        status, raw = _post_json(
+            missing,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/submit",
+            body=_public_web_tavily_body(
+                request_id=request_id,
+                session_id=session_id,
+                workspace_target=workspace_target,
+            ),
+        )
+        response_bytes.append(raw)
+        assert status == 422
+        assert json.loads(raw) == {
+            "ok": False,
+            "reason_code": "submission_search_api_key_required",
+            "search_secret_status": "required",
+        }
+    finally:
+        missing.close()
+    assert not env_path.exists()
+    assert db_path.read_bytes() == db_bytes
+
+    recovery_submitter = InitWebSubmitter(base_dir=tmp_path)
+    recovery = create_init_web_server(recovery_submitter, exit_on_success=False)
+    recovery.start()
+    try:
+        token, session_id = _credentials(recovery.url)
+        status, raw = _post_json(
+            recovery,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/search-secret",
+            body={"provider": "tavily", "api_key": sentinel},
+        )
+        response_bytes.append(raw)
+        assert status == 200
+        status, raw = _post_json(
+            recovery,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/submit",
+            body=_public_web_tavily_body(
+                request_id=request_id,
+                session_id=session_id,
+                workspace_target=workspace_target,
+            ),
+        )
+        response_bytes.append(raw)
+        assert status == 200
+        recovered_payload = json.loads(raw)
+        assert recovered_payload["status"] == "replayed"
+        assert recovered_payload["search_secret_status"] == "recovered"
+        assert env_path.is_file()
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+        assert get_known_env_value("TAVILY_API_KEY", workspace) == sentinel
+        recovered_env_mtime = env_path.stat().st_mtime_ns
+        assert db_path.read_bytes() == db_bytes
+
+        status, raw = _post_json(
+            recovery,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/submit",
+            body=_public_web_tavily_body(
+                request_id=request_id,
+                session_id=session_id,
+                workspace_target=workspace_target,
+            ),
+        )
+        response_bytes.append(raw)
+        assert status == 200
+        assert json.loads(raw)["search_secret_status"] == "ready"
+        assert env_path.stat().st_mtime_ns == recovered_env_mtime
+
+        env_path.unlink()
+
+        def _secret_effect_must_not_run(**_kwargs: object) -> str:
+            raise AssertionError("semantic conflict must precede credential effect")
+
+        monkeypatch.setattr(
+            recovery_submitter,
+            "_apply_search_secret_effect",
+            _secret_effect_must_not_run,
+        )
+        status, raw = _post_json(
+            recovery,
+            token=token,
+            session_id=session_id,
+            path="/api/v1/submit",
+            body=_public_web_tavily_body(
+                request_id=request_id,
+                session_id=session_id,
+                workspace_target=workspace_target,
+                task_objective="Prepare a changed manufacturing brief.",
+            ),
+        )
+        response_bytes.append(raw)
+        assert status == 409
+        assert json.loads(raw) == {
+            "ok": False,
+            "reason_code": "submission_replay_conflict",
+        }
+    finally:
+        recovery.close()
+
+    assert not env_path.exists()
+    assert db_path.read_bytes() == db_bytes
+    assert provider_calls == []
+    assert all(sentinel.encode("utf-8") not in raw for raw in response_bytes)
 
 
 def test_source_upload_is_session_bound_and_server_hashed(tmp_path: Path) -> None:
