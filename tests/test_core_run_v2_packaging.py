@@ -100,6 +100,9 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
         """
         import http.client
         import json
+        import os
+        from contextlib import redirect_stdout
+        from io import StringIO
         from pathlib import Path
         import sqlite3
         import stat
@@ -107,6 +110,7 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
         from urllib.parse import parse_qs, urlsplit
 
         import multi_agent_brief
+        from multi_agent_brief.cli.main import main
         from multi_agent_brief.control_store import SQLiteControlStore
         from multi_agent_brief.core.env import get_known_env_value
         from multi_agent_brief.product.init_web.server import (
@@ -114,10 +118,6 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
             create_init_web_server,
         )
         from multi_agent_brief.product.init_web.submit import InitWebSubmitter
-        from multi_agent_brief.runtime_host_v2.codex import (
-            workspace_codex_adapter_loader,
-        )
-        from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
         from multi_agent_brief.sources.web_search import WebSearchProvider
 
         base = Path(sys.argv[1])
@@ -126,6 +126,14 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
         def require(condition, message):
             if not condition:
                 raise AssertionError(message)
+
+        def require_workspace_secret(path, message):
+            require(path.is_file(), message)
+            if os.name != "nt":
+                require(
+                    stat.S_IMODE(path.stat().st_mode) == 0o600,
+                    f"{message} mode",
+                )
 
         require(
             Path(multi_agent_brief.__file__).resolve().is_relative_to(
@@ -237,8 +245,7 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
         workspace = base / "workspace"
         db_path = workspace / "briefloop.db"
         env_path = workspace / ".env"
-        require(env_path.is_file(), "workspace env missing")
-        require(stat.S_IMODE(env_path.stat().st_mode) == 0o600, "workspace env mode")
+        require_workspace_secret(env_path, "workspace env missing")
         require(
             get_known_env_value("TAVILY_API_KEY", workspace) == sentinel,
             "workspace env value mismatch",
@@ -274,17 +281,19 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
                 connection.execute("PRAGMA user_version").fetchone()[0] == 9,
                 "migration 0009 was not installed",
             )
-        continuation = RuntimeHostService(
-            workspace,
-            adapter_loader=workspace_codex_adapter_loader(workspace),
-        ).continue_authorized()
-        require(continuation.status == "needs_attention", "continuation status")
+        continuation_stdout = StringIO()
+        with redirect_stdout(continuation_stdout):
+            continuation_returncode = main(
+                ["runtime", "continue", "--workspace", str(workspace)]
+            )
+        continuation = json.loads(continuation_stdout.getvalue())
+        require(continuation_returncode == 0, "continuation CLI return")
+        require(continuation["status"] == "needs_attention", "continuation status")
         require(
-            continuation.reason_code
+            continuation["reason_code"]
             == "automatic_source_acquisition_not_yet_available",
             "continuation reason",
         )
-        require(continuation.trace.transaction_ids == [], "continuation wrote Store")
         require(db_path.read_bytes() == db_bytes, "continuation changed Store")
         initial_env_mtime = env_path.stat().st_mtime_ns
 
@@ -368,8 +377,7 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
                 recovered["search_secret_status"] == "recovered",
                 "recovery secret status",
             )
-            require(env_path.is_file(), "recovery did not write env")
-            require(stat.S_IMODE(env_path.stat().st_mode) == 0o600, "recovery env mode")
+            require_workspace_secret(env_path, "recovery did not write env")
             require(
                 get_known_env_value("TAVILY_API_KEY", workspace) == sentinel,
                 "recovery env value",
@@ -436,9 +444,9 @@ def test_public_web_discovery_authorization_source_and_wheel_parity(
                 snapshot.run_source_discovery_authorizations
             ),
             "execution_authorizations": len(snapshot.run_execution_authorizations),
-            "continuation_status": continuation.status,
-            "continuation_reason": continuation.reason_code,
-            "continuation_effect": continuation.trace.next_action.effect_kind,
+            "continuation_returncode": continuation_returncode,
+            "continuation_status": continuation["status"],
+            "continuation_reason": continuation["reason_code"],
             "ready_replay_status": ready["search_secret_status"],
             "missing_reason": missing["reason_code"],
             "recovered_status": recovered["search_secret_status"],
