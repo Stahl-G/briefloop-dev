@@ -23,6 +23,7 @@ from multi_agent_brief.contracts.v2 import (
     InvocationStartRequest,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     canonical_run_direction_for_binding,
     RunDirection,
     RunIdentity,
@@ -367,6 +368,9 @@ class CoreRunService:
         adapter_hash = sha256_hex(adapter_bytes)
         source_plan_hash = sha256_hex(source_plan_bytes)
         authorization_input = request.execution_authorization
+        source_discovery_input = request.source_discovery_authorization
+        if authorization_input is not None and source_discovery_input is not None:
+            raise CoreRunError("core_run_contract_mismatch")
         execution_manifest_bytes: bytes | None = None
         if authorization_input is not None:
             execution_manifest_bytes = canonical_json_bytes(
@@ -378,6 +382,20 @@ class CoreRunService:
                 authorization_input.source_manifest_sha256
             ):
                 raise CoreRunError("core_run_contract_mismatch")
+        discovery_route: RuntimeSourceRouteBinding | None = None
+        if source_discovery_input is not None:
+            routes = [
+                route
+                for route in source_plan.routes
+                if route.route_id == source_discovery_input.route_id
+                and route.provider_id == source_discovery_input.provider_id
+                and route.execution_owner == source_discovery_input.execution_owner
+                and route.route_kind == "external_api"
+                and route.acquisition_spec is not None
+            ]
+            if len(routes) != 1:
+                raise CoreRunError("core_run_contract_mismatch")
+            discovery_route = routes[0]
         fingerprint = run_contract_fingerprint(
             runtime=request.runtime,
             stage_specs_schema=str(contracts.stage_specs["schema_version"]),
@@ -570,6 +588,43 @@ class CoreRunService:
                     strict=True,
                 )
             )
+            source_discovery_authorization = (
+                None
+                if source_discovery_input is None or discovery_route is None
+                else RunSourceDiscoveryAuthorization.model_validate(
+                    {
+                        "schema_version": RunSourceDiscoveryAuthorization.schema_id,
+                        "authorization_id": derived_id(
+                            "DISCOVERY-AUTH", request.request_id, request_fingerprint
+                        ),
+                        "run_id": request.run_id,
+                        "workspace_id": request.workspace_id,
+                        "run_contract_fingerprint": binding.contract_fingerprint,
+                        "run_direction_fingerprint": canonical_fingerprint(
+                            canonical_run_direction_for_binding(
+                                request.run_direction.model_dump(
+                                    mode="json", exclude_unset=False
+                                )
+                            )
+                        ),
+                        "runtime_source_plan_fingerprint": (
+                            source_plan.source_plan_fingerprint
+                        ),
+                        "source_route_fingerprint": discovery_route.route_fingerprint,
+                        "route_id": source_discovery_input.route_id,
+                        "provider_id": source_discovery_input.provider_id,
+                        "execution_owner": source_discovery_input.execution_owner,
+                        "credential_env": source_discovery_input.credential_env,
+                        "completion_target": source_discovery_input.completion_target,
+                        "repair_budget": source_discovery_input.repair_budget,
+                        "authorization_event_id": event_id,
+                        "accepted_transaction_id": request.request_id,
+                        "request_fingerprint": request_fingerprint,
+                        "created_at": now,
+                    },
+                    strict=True,
+                )
+            )
             event = _core_event(
                 event_id=event_id,
                 run_id=request.run_id,
@@ -601,6 +656,10 @@ class CoreRunService:
             unit.put_run_contract_binding(binding)
             if execution_authorization is not None:
                 unit.put_run_execution_authorization(execution_authorization)
+            if source_discovery_authorization is not None:
+                unit.put_run_source_discovery_authorization(
+                    source_discovery_authorization
+                )
             artifact_contracts = {
                 str(item["artifact_id"]): item for item in contracts.artifacts
             }
@@ -1907,7 +1966,9 @@ _SECRET_BEARING_INPUT_SUFFIXES = tuple(
 # The bootstrap's strict, non-secret control DTO uses this historical suffix;
 # it is validated separately as a Pydantic authorization input, never treated
 # as a credential selector or persisted secret.
-_NON_SECRET_CONTROL_INPUT_KEYS = frozenset({"execution_authorization"})
+_NON_SECRET_CONTROL_INPUT_KEYS = frozenset(
+    {"execution_authorization", "source_discovery_authorization"}
+)
 _LEGACY_CONTROL_PATHS = (
     "output/intermediate/runtime_manifest.json",
     "output/intermediate/workflow_state.json",

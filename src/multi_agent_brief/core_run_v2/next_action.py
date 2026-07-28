@@ -99,6 +99,20 @@ def classify_core_run_next_action(verified: VerifiedCoreRun) -> CoreRunNextActio
     """Return exactly one legal category without consulting mutable files."""
 
     snapshot = verified.snapshot
+    discovery_authorizations = snapshot.run_source_discovery_authorizations
+    if discovery_authorizations and not snapshot.run_execution_authorizations:
+        if len(discovery_authorizations) != 1:
+            raise CoreRunError("control_store_integrity_invalid")
+        authorization = discovery_authorizations[0]
+        return _action(
+            verified,
+            action_kind="blocked",
+            effect_kind="source_discovery_acquisition_unavailable",
+            reason_code="automatic_source_acquisition_not_yet_available",
+            stage_id="source-discovery",
+            source_route_id=authorization.route_id,
+            source_provider_id=authorization.provider_id,
+        )
     gate_repair = None
     if snapshot.gate_repair_cycles:
         gate_repair = classify_gate_repair_legality(snapshot)

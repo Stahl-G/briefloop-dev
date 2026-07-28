@@ -339,6 +339,10 @@ demo 用的是合成材料，主要用来展示证据链和门禁行为。真实
   --runtime codex`，随后使用 `briefloop runtime next`、
   `invocation-start`、`invocation-accept|fail` 和 `apply`
 - Experimental 一次性网页初始化：`briefloop init <path> --web`
+- Experimental 的 pre-provider 公开网页发现授权：人类确认的 Tavily 方向会记录为独立
+  Store Receipt，并返回受支持的 `briefloop runtime continue` handoff。本切片中的
+  Tavily 自动获取仍为 NOT MEASURED 且不可用：不会获取或冻结来源、执行角色，或达到
+  `finalized_local`。
 - 尽力而为且受平台能力门禁约束的本地静态只读四 Tab 视图：
   `briefloop quality html --workspace <path>
   [--open]`；Brief 显示 Store 绑定的 `finalized_local` reader，Quality 为确定性

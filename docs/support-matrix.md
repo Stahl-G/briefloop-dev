@@ -58,6 +58,7 @@ validation unless that is stated separately.
 | `briefloop` CLI | Supported |
 | `multi-agent-brief` CLI | Supported compatibility entrypoint with identical behavior; retained for existing scripts and installs |
 | `briefloop run --workspace <path> --runtime codex` plus `runtime next/invocation-start/invocation-validate/invocation-accept/invocation-fail/apply/diagnose`; strict JSON proposal contract preflight | Experimental; fresh SQLite-only, no JSON migration or fallback |
+| Public-web/Tavily discovery authorization from confirmed `init --web` direction, followed by `briefloop runtime continue` | Experimental pre-provider boundary only; a distinct Store receipt is not execution authority. The current action is zero-write/zero-secret/zero-SDK/zero-provider/zero-network attention. Automatic Tavily acquisition is NOT MEASURED and unavailable; it creates no source evidence, role execution, Gate, finalization, or `finalized_local` result |
 | Legacy runtime names and `operator --recipe fast-rerun` | Unsupported for the SQLite-only active path |
 | `briefloop status --workspace <path>` | Supported read-only Store projection for SQLite workspaces; JSON-only workspace unsupported |
 | Legacy `briefloop deliver` commands | Unsupported on SQLite; approval and delivery use typed Store actions through `runtime apply` |
@@ -85,7 +86,7 @@ validation unless that is stated separately.
 | `briefloop experiments laj present` | Experimental; deterministic standalone JSON/Markdown/HTML projection of one verified shadow archive; invalid, missing, stale, abstained, or unavailable results display no advice and have zero runtime authority |
 | `briefloop experiments laj study-preflight/budgeted-shadow-run/study-compare` | Experimental; strict target eligibility, complete-trial call/token budget, and offline exact dimension/span-overlap comparison only; advisory with zero runtime authority; utility and efficacy NOT MEASURED |
 | `briefloop init --from-onboarding` | Supported |
-| `briefloop init --web [--port <n>]` | Experimental; one-shot loopback wizard that creates the workspace through the same ControlStore bootstrap path and returns the real TransactionReceipt |
+| `briefloop init --web [--port <n>]` | Experimental; one-shot loopback wizard that creates the workspace through the same ControlStore bootstrap path and returns the real TransactionReceipt. A confirmed public-web/Tavily direction records only the distinct pre-provider discovery authorization described above |
 | `briefloop quality html --workspace <path> [--open] [--laj-view <laj.json>]` | Experimental; best-effort, capability-gated local static read-only four-tab surface: verified Store-bound `finalized_local` Brief, deterministic Quality, optional advisory LAJ (NOT MEASURED), and unavailable Improvement; unsupported platforms return no projection path; no approval, package, delivery, publication, persistent-server, automatic-evaluation, or learning affordance |
 | `briefloop onboard` | Supported |
 | `briefloop doctor` | Supported |

@@ -48,8 +48,19 @@ deterministic effects. `role_work_required` names the exact envelope whose
 scratch proposal the current session must produce; call the command again
 after proposal validation. `proposal_invalid`, `needs_human`, and
 `needs_attention` are stop/attention results. `finalized_local` is terminal and
-never implies approval, packaging, delivery, or repair. Runs without the
-authorization retain the granular protocol below and receive a zero-write
+never implies approval, packaging, delivery, or repair.
+
+`RunSourceDiscoveryAuthorization` is a distinct Store authority, not an
+execution authorization. A run with this authority and no
+`RunExecutionAuthorization` also uses `briefloop runtime continue`; in the 1A
+development slice it re-verifies Store and a fresh action, then returns the
+fixed pre-1B `needs_attention` result that automatic source acquisition is not
+yet available. That result performs zero writes, secret lookup, SDK import,
+provider call, or network effect. Discovery authorization does not imply
+acquired sources, claims eligibility, role execution, Gate, finalization,
+approval, packaging, or delivery. It does not claim Tavily acquisition is
+available or that the run reaches `finalized_local`. A run with neither
+discovery nor execution authorization receives the existing zero-write
 unsupported/manual result from `runtime continue`.
 
 At truthful `finalized_local`, the result may include a best-effort

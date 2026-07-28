@@ -363,6 +363,11 @@ Current main entrypoints:
   --runtime codex`, followed by `briefloop runtime next`,
   `invocation-start`, `invocation-accept|fail`, and `apply`
 - Experimental one-shot web initialization: `briefloop init <path> --web`
+- Experimental pre-provider public-web discovery authorization: a human-confirmed
+  Tavily direction records a distinct Store receipt and returns the supported
+  `briefloop runtime continue` handoff. Automatic Tavily acquisition is NOT
+  MEASURED and unavailable in this slice: it does not fetch or freeze sources,
+  execute roles, or reach `finalized_local`.
 - best-effort, capability-gated local static read-only four-tab view:
   `briefloop quality html --workspace
   <path> [--open]`; Brief shows the verified Store-bound `finalized_local`

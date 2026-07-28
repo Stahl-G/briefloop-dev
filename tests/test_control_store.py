@@ -1066,6 +1066,7 @@ def test_schema_settings_and_exact_table_universe(tmp_path: Path) -> None:
         "proposal_source_bindings",
             "run_contract_bindings",
             "run_execution_authorizations",
+            "run_source_discovery_authorizations",
             "owned_artifact_submissions",
         "stage_transitions",
         "stage_artifact_bindings",
@@ -1086,7 +1087,8 @@ def test_schema_settings_and_exact_table_universe(tmp_path: Path) -> None:
         "gate_repair_outcome_evaluations",
             "transaction_run_contract_bindings",
             "transaction_run_execution_authorizations",
-        "transaction_owned_artifact_submissions",
+            "transaction_run_source_discovery_authorizations",
+            "transaction_owned_artifact_submissions",
         "transaction_stage_transitions",
         "transaction_stage_artifact_bindings",
         "transaction_stage_gate_bindings",
@@ -1153,7 +1155,7 @@ def test_schema_settings_and_exact_table_universe(tmp_path: Path) -> None:
         assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert store._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert store._connection.execute("PRAGMA synchronous").fetchone()[0] == 2
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 9
         tables = {
             row[0]
             for row in store._connection.execute(
@@ -2602,7 +2604,7 @@ def test_future_schema_fails_closed(tmp_path: Path) -> None:
     store = _create_store(tmp_path)
     store.close()
     connection = sqlite3.connect(tmp_path / "control.db")
-    connection.execute("PRAGMA user_version = 9")
+    connection.execute("PRAGMA user_version = 10")
     connection.close()
     with pytest.raises(ControlStoreSchemaError) as error:
         SQLiteControlStore.open(tmp_path / "control.db")

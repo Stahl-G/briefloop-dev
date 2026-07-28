@@ -33,6 +33,250 @@ from multi_agent_brief.runtime_host_v2.initialization import (
 
 ROOT = Path(__file__).parents[1]
 
+_SOURCE_CONTROLSTORE_REFERENCE = (
+    "skills/briefloop/references/codex-controlstore-v2.md"
+)
+_PACKAGED_CONTROLSTORE_REFERENCE = (
+    "skills/briefloop/references/controlstore-v2.md"
+)
+
+
+def test_discovery_authorization_runtime_references_are_byte_identical() -> None:
+    canonical = (
+        ROOT / ".agents" / _SOURCE_CONTROLSTORE_REFERENCE
+    ).read_bytes()
+    hermes = (
+        ROOT
+        / "integrations/hermes-plugin/mabw"
+        / _SOURCE_CONTROLSTORE_REFERENCE
+    ).read_bytes()
+    packaged = (
+        ROOT
+        / "src/multi_agent_brief/runtime_kits/codex"
+        / _PACKAGED_CONTROLSTORE_REFERENCE
+    ).read_bytes()
+    assert canonical == hermes == packaged
+    text = canonical.decode("utf-8")
+    assert "RunSourceDiscoveryAuthorization" in text
+    assert "automatic source acquisition is not\nyet available" in text
+    assert "zero writes, secret lookup, SDK import,\nprovider call, or network effect" in text
+
+
+def test_public_web_discovery_authorization_source_and_wheel_parity(
+    tmp_path: Path,
+) -> None:
+    build_root = tmp_path / "build-root"
+    build_root.mkdir()
+    shutil.copy2(ROOT / "pyproject.toml", build_root / "pyproject.toml")
+    shutil.copy2(ROOT / "README.md", build_root / "README.md")
+    shutil.copytree(ROOT / "src", build_root / "src")
+    wheel_dir = tmp_path / "wheel"
+    wheel_dir.mkdir()
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            ".",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(wheel_dir),
+        ],
+        cwd=build_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    wheel_path = next(wheel_dir.glob("briefloop-*.whl"))
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    with zipfile.ZipFile(wheel_path) as archive:
+        archive.extractall(installed)
+
+    script = textwrap.dedent(
+        """
+        import json
+        from pathlib import Path
+        import sqlite3
+        import sys
+
+        import multi_agent_brief
+        from multi_agent_brief.control_store import SQLiteControlStore
+        from multi_agent_brief.product.init_web.submit import (
+            SUBMISSION_SCHEMA,
+            InitWebSubmitter,
+        )
+        from multi_agent_brief.runtime_host_v2.codex import (
+            workspace_codex_adapter_loader,
+        )
+        from multi_agent_brief.runtime_host_v2.service import RuntimeHostService
+        from multi_agent_brief.sources.web_search import WebSearchProvider
+
+        base = Path(sys.argv[1])
+        expected_package_root = Path(sys.argv[2]).resolve()
+
+        def require(condition, message):
+            if not condition:
+                raise AssertionError(message)
+
+        require(
+            Path(multi_agent_brief.__file__).resolve().is_relative_to(
+                expected_package_root
+            ),
+            "package root mismatch",
+        )
+
+        def _provider_must_not_run(*_args, **_kwargs):
+            raise AssertionError("provider must not run in 1A")
+
+        WebSearchProvider.collect = _provider_must_not_run
+        sentinel = "tvly-wheel-discovery-sentinel"
+        submitter = InitWebSubmitter(base_dir=base)
+        configured = submitter.configure_search_secret(
+            session_id="wheel-discovery-session",
+            body={"provider": "tavily", "api_key": sentinel},
+        )
+        require(configured["configured"] is True, "secret configuration failed")
+        body = {
+            "schema_version": SUBMISSION_SCHEMA,
+            "request_id": "REQ-WHEEL-DISCOVERY-001",
+            "payload": {
+                "workspace_target": "workspace",
+                "selections": {
+                    "company": "Wheel ExampleCo",
+                    "industry_or_theme": "manufacturing",
+                    "task_objective": "Prepare a packaged discovery brief.",
+                    "brief_title": "Wheel discovery brief",
+                    "audience": "management",
+                    "interface_language": "en",
+                    "output_language": "en",
+                    "cadence": "weekly",
+                    "focus_areas": ["operations"],
+                    "output_formats": ["markdown"],
+                    "forbidden_sources": [],
+                    "source_profile": "llm_decide",
+                    "web_search_mode": "external_api",
+                    "search_backend": "tavily",
+                    "output_extent": "balanced",
+                },
+                "completion_target": "finalized_local",
+                "repair_budget": 1,
+                "search_secret_session_id": "wheel-discovery-session",
+                "human_confirmation": True,
+            },
+        }
+        status, first = submitter.submit(body)
+        require(status == 200, "initial submission failed")
+        require(first["status"] == "committed", "initial status mismatch")
+        require(first["execution_authorized"] is False, "execution authority leaked")
+        require(
+            first["source_discovery_authorized"] is True,
+            "discovery authority missing",
+        )
+        require(first["search_secret_status"] == "ready", "secret status mismatch")
+        require(sentinel not in json.dumps(first), "secret leaked in response")
+        workspace = base / "workspace"
+        db_path = workspace / "briefloop.db"
+        db_bytes = db_path.read_bytes()
+        with SQLiteControlStore.open(db_path) as store:
+            head = store.load_workspace_run_head()
+            require(head is not None, "workspace head missing")
+            snapshot = store.load_snapshot(head.current_run_id)
+        require(
+            len(snapshot.run_execution_authorizations) == 0,
+            "execution authorization was created",
+        )
+        require(
+            len(snapshot.run_source_discovery_authorizations) == 1,
+            "discovery authorization missing",
+        )
+        require(not snapshot.sources, "sources were acquired")
+        require(sentinel.encode("utf-8") not in db_bytes, "secret leaked in Store")
+        with sqlite3.connect(db_path) as connection:
+            require(
+                connection.execute("PRAGMA user_version").fetchone()[0] == 9,
+                "migration 0009 was not installed",
+            )
+        continuation = RuntimeHostService(
+            workspace,
+            adapter_loader=workspace_codex_adapter_loader(workspace),
+        ).continue_authorized()
+        require(continuation.status == "needs_attention", "continuation status")
+        require(
+            continuation.reason_code
+            == "automatic_source_acquisition_not_yet_available",
+            "continuation reason",
+        )
+        require(continuation.trace.transaction_ids == [], "continuation wrote Store")
+        require(db_path.read_bytes() == db_bytes, "continuation changed Store")
+        replay_status, replay = submitter.submit(body)
+        require(replay_status == 200, "replay failed")
+        require(replay["status"] == "replayed", "replay status mismatch")
+        require(replay["search_secret_status"] == "ready", "replay secret mismatch")
+        require(db_path.read_bytes() == db_bytes, "replay changed Store")
+        print(json.dumps({
+            "optimize": sys.flags.optimize,
+            "schema_version": snapshot.run_source_discovery_authorizations[0].schema_version,
+            "store_revision": snapshot.store_revision,
+            "source_discovery_authorizations": len(
+                snapshot.run_source_discovery_authorizations
+            ),
+            "execution_authorizations": len(snapshot.run_execution_authorizations),
+            "continuation_status": continuation.status,
+            "continuation_reason": continuation.reason_code,
+            "continuation_effect": continuation.trace.next_action.effect_kind,
+            "replay_status": replay["status"],
+            "secret_status": replay["search_secret_status"],
+        }, sort_keys=True))
+        """
+    )
+    script_path = tmp_path / "wheel_discovery_authorization.py"
+    script_path.write_text(script, encoding="utf-8")
+    source_base = tmp_path / "source-base"
+    source_environment = dict(os.environ)
+    source_environment["PYTHONPATH"] = str(ROOT / "src")
+    child_optimize = () if sys.flags.optimize == 0 else (f"-{'O' * sys.flags.optimize}",)
+    source_run = subprocess.run(
+        [
+            sys.executable,
+            *child_optimize,
+            str(script_path),
+            str(source_base),
+            str(ROOT / "src"),
+        ],
+        cwd=tmp_path,
+        env=source_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert source_run.returncode == 0, source_run.stdout + source_run.stderr
+    installed_base = tmp_path / "installed-base"
+    installed_environment = dict(os.environ)
+    installed_environment["PYTHONPATH"] = str(installed)
+    installed_run = subprocess.run(
+        [
+            sys.executable,
+            *child_optimize,
+            str(script_path),
+            str(installed_base),
+            str(installed),
+        ],
+        cwd=tmp_path,
+        env=installed_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert installed_run.returncode == 0, installed_run.stdout + installed_run.stderr
+    source_payload = json.loads(source_run.stdout)
+    installed_payload = json.loads(installed_run.stdout)
+    assert source_payload == installed_payload
+    assert source_payload["optimize"] == sys.flags.optimize
+
 
 def _real_finalized_local_workspace(
     tmp_path: Path,
@@ -111,6 +355,17 @@ def test_source_and_non_editable_wheel_hardlink_intake_parity(
     installed.mkdir()
     with zipfile.ZipFile(wheel_path) as archive:
         archive.extractall(installed)
+    source_reference = (
+        ROOT
+        / "src/multi_agent_brief/runtime_kits/codex/skills/briefloop/references"
+        / "controlstore-v2.md"
+    )
+    installed_reference = (
+        installed
+        / "multi_agent_brief/runtime_kits/codex/skills/briefloop/references"
+        / "controlstore-v2.md"
+    )
+    assert installed_reference.read_bytes() == source_reference.read_bytes()
 
     script = textwrap.dedent(
         """
@@ -581,6 +836,17 @@ def test_non_editable_wheel_runs_complete_dormant_core_spine(
         ).joinpath("migrations", "0008.sql")
         assert migration_0008.is_file()
         assert "PRAGMA user_version=8;" in migration_0008.read_text(encoding="utf-8")
+        migration_0009 = resources.files(
+            "multi_agent_brief.control_store"
+        ).joinpath("migrations", "0009.sql")
+        assert migration_0009.is_file()
+        assert "PRAGMA user_version=9;" in migration_0009.read_text(encoding="utf-8")
+        discovery_reference = resources.files("multi_agent_brief").joinpath(
+            "runtime_kits", "codex", "skills", "briefloop", "references",
+            "controlstore-v2.md",
+        ).read_text(encoding="utf-8")
+        assert "RunSourceDiscoveryAuthorization" in discovery_reference
+        assert "automatic source acquisition is not\nyet available" in discovery_reference
         assert callable(build_checkout_revision)
         assert CheckoutPublicationEngine.__module__.endswith(".publication")
         assert MAX_SOURCE_PACK_MEMBERS == 256

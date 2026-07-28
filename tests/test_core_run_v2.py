@@ -5916,9 +5916,10 @@ def test_core_effect_receipt_binding_table_is_exact() -> None:
             {
                 "artifact_revisions",
                 "artifact_identities",
-                "run_contract_bindings",
-                "run_execution_authorizations",
-                "stage_transitions",
+                    "run_contract_bindings",
+                    "run_execution_authorizations",
+                    "run_source_discovery_authorizations",
+                    "stage_transitions",
                 "run_integrity_records",
             }
         ),

@@ -336,7 +336,28 @@ class RuntimeHostService:
                 adapter_loader=self._adapter_loader,
             )
             action = current.action
-            if len(current.verified.snapshot.run_execution_authorizations) != 1:
+            execution_authorizations = (
+                current.verified.snapshot.run_execution_authorizations
+            )
+            discovery_authorizations = (
+                current.verified.snapshot.run_source_discovery_authorizations
+            )
+            if (
+                not execution_authorizations
+                and len(discovery_authorizations) == 1
+                and action.action_kind == "blocked"
+                and action.effect_kind == "source_discovery_acquisition_unavailable"
+                and action.reason_code
+                == "automatic_source_acquisition_not_yet_available"
+            ):
+                return build_runtime_continuation_result(
+                    current.verified,
+                    action,
+                    status="needs_attention",
+                    reason_code=action.reason_code,
+                    transaction_ids=tuple(transaction_ids),
+                )
+            if len(execution_authorizations) != 1:
                 return build_runtime_continuation_result(
                     current.verified,
                     action,

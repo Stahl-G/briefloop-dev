@@ -68,7 +68,7 @@ def test_init_web_handoff_prints_exact_browser_selected_target(
     assert server.closed is True
 
 
-def test_init_web_public_search_handoff_uses_standard_codex_run(
+def test_init_web_discovery_authorized_handoff_uses_runtime_continue(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     selected = tmp_path / "public-search"
@@ -79,6 +79,7 @@ def test_init_web_public_search_handoff_uses_standard_codex_run(
             run_id="RUN-PUBLIC",
             transaction_id="TX-PUBLIC",
             execution_authorized=False,
+            source_discovery_authorized=True,
         )
     )
     monkeypatch.setattr(
@@ -90,11 +91,7 @@ def test_init_web_public_search_handoff_uses_standard_codex_run(
     assert _init_web_wizard(SimpleNamespace(port=0)) == 0
 
     output = capsys.readouterr().out
-    assert (
-        f"briefloop run --workspace {selected} --runtime codex --skip-doctor"
-        in output
-    )
-    assert "runtime continue" not in output
+    assert f"briefloop runtime continue --workspace {selected}" in output
 
 
 @pytest.mark.parametrize(

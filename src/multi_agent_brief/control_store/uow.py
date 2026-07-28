@@ -48,6 +48,7 @@ from multi_agent_brief.contracts.v2 import (
     ArtifactSupersessionRecord,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     RunIdentity,
     RunIntegrityRecord,
     RunArchiveArtifactBinding,
@@ -130,6 +131,9 @@ class ControlUnitOfWork:
         ] = {}
         self._run_contract_binding: RunContractBinding | None = None
         self._run_execution_authorization: RunExecutionAuthorization | None = None
+        self._run_source_discovery_authorization: (
+            RunSourceDiscoveryAuthorization | None
+        ) = None
         self._owned_artifact_submissions: dict[
             str, OwnedArtifactSubmissionRecord
         ] = {}
@@ -352,6 +356,18 @@ class ControlUnitOfWork:
         if self._run_execution_authorization is not None:
             raise ControlStoreConflict("duplicate_staged_record")
         self._run_execution_authorization = snapshot
+
+    def put_run_source_discovery_authorization(
+        self,
+        record: RunSourceDiscoveryAuthorization,
+    ) -> None:
+        snapshot = self._snapshot_record(record, RunSourceDiscoveryAuthorization)
+        self._require_run(snapshot)
+        if snapshot.workspace_id != self._store.workspace_id:
+            raise ControlStoreConflict("control_record_workspace_mismatch")
+        if self._run_source_discovery_authorization is not None:
+            raise ControlStoreConflict("duplicate_staged_record")
+        self._run_source_discovery_authorization = snapshot
 
     def put_owned_artifact_submission(
         self,
@@ -685,6 +701,11 @@ class ControlUnitOfWork:
             "run_execution_authorization": (
                 self._record_payload(self._run_execution_authorization)
                 if self._run_execution_authorization is not None
+                else None
+            ),
+            "run_source_discovery_authorization": (
+                self._record_payload(self._run_source_discovery_authorization)
+                if self._run_source_discovery_authorization is not None
                 else None
             ),
             "owned_artifact_submissions": [

@@ -1481,6 +1481,61 @@ class RunExecutionAuthorization(StrictModel):
     created_at: IsoDateTime
 
 
+class RunSourceDiscoveryAuthorizationInput(StrictModel):
+    """Strict bootstrap input for one Store-owned Tavily discovery authority."""
+
+    schema_id = "briefloop.run_source_discovery_authorization_input.v2"
+
+    schema_version: Literal["briefloop.run_source_discovery_authorization_input.v2"]
+    route_id: Literal["web-search"]
+    provider_id: Literal["tavily"]
+    execution_owner: Literal["deterministic"]
+    credential_env: Literal["TAVILY_API_KEY"]
+    completion_target: Literal["finalized_local"]
+    repair_budget: Literal[1]
+
+
+class RunSourceDiscoveryAuthorizationBootstrap(StrictModel):
+    """Non-authoritative init-file request for the discovery authority."""
+
+    schema_id = "briefloop.run_source_discovery_authorization_bootstrap.v2"
+
+    schema_version: Literal[
+        "briefloop.run_source_discovery_authorization_bootstrap.v2"
+    ]
+    route_id: Literal["web-search"]
+    provider_id: Literal["tavily"]
+    execution_owner: Literal["deterministic"]
+    credential_env: Literal["TAVILY_API_KEY"]
+    completion_target: Literal["finalized_local"]
+    repair_budget: Literal[1]
+
+
+class RunSourceDiscoveryAuthorization(StrictModel):
+    """Receipt-owned authority for one future, not-yet-executed source route."""
+
+    schema_id = "briefloop.run_source_discovery_authorization.v2"
+
+    schema_version: Literal["briefloop.run_source_discovery_authorization.v2"]
+    authorization_id: ContractId
+    run_id: ContractId
+    workspace_id: ContractId
+    run_contract_fingerprint: Sha256
+    run_direction_fingerprint: Sha256
+    runtime_source_plan_fingerprint: Sha256
+    source_route_fingerprint: Sha256
+    route_id: Literal["web-search"]
+    provider_id: Literal["tavily"]
+    execution_owner: Literal["deterministic"]
+    credential_env: Literal["TAVILY_API_KEY"]
+    completion_target: Literal["finalized_local"]
+    repair_budget: Literal[1]
+    authorization_event_id: ContractId
+    accepted_transaction_id: ContractId
+    request_fingerprint: Sha256
+    created_at: IsoDateTime
+
+
 def authorized_input_classification_bytes(
     manifest: ExecutionSourceManifest,
     sources: list[AcceptedSourceRecord],
@@ -1540,6 +1595,9 @@ class CoreRunInitializeRequest(StrictModel):
     input_governance_required: bool
     runtime_adapter_binding: "RuntimeAdapterBinding"
     execution_authorization: "RunExecutionAuthorizationInput | None" = None
+    source_discovery_authorization: "RunSourceDiscoveryAuthorizationInput | None" = (
+        None
+    )
 
     @field_validator("gate_strictness")
     @classmethod
@@ -1563,6 +1621,9 @@ class WorkspaceControlStoreBootstrapV2(StrictModel):
     gate_strictness: dict[GateId, bool]
     run_direction: RunDirection
     execution_authorization: "RunExecutionAuthorizationBootstrap | None" = None
+    source_discovery_authorization: (
+        "RunSourceDiscoveryAuthorizationBootstrap | None"
+    ) = None
 
     @field_validator("gate_strictness")
     @classmethod
@@ -1987,6 +2048,7 @@ class CoreRunNextAction(StrictModel):
                 "source_input_required",
                 "role_proposal",
                 "role_unavailable",
+                "source_discovery_acquisition_unavailable",
             }
             and (
                 self.effect_kind != "role_unavailable"
@@ -3608,6 +3670,10 @@ class RunExecutionAuthorizationReference(StrictModel):
     authorization_id: ContractId
 
 
+class RunSourceDiscoveryAuthorizationReference(StrictModel):
+    authorization_id: ContractId
+
+
 class OwnedArtifactSubmissionReference(StrictModel):
     submission_id: ContractId
 
@@ -3770,6 +3836,9 @@ class TransactionReceipt(StrictModel):
     run_execution_authorizations: list[RunExecutionAuthorizationReference] = Field(
         default_factory=list
     )
+    run_source_discovery_authorizations: list[
+        RunSourceDiscoveryAuthorizationReference
+    ] = Field(default_factory=list)
     owned_artifact_submissions: list[OwnedArtifactSubmissionReference] = Field(
         default_factory=list
     )
@@ -3851,6 +3920,7 @@ class TransactionReceipt(StrictModel):
         relation_lists = (
             self.run_contract_bindings,
             self.run_execution_authorizations,
+            self.run_source_discovery_authorizations,
             self.owned_artifact_submissions,
             self.stage_transitions,
             self.stage_artifact_bindings,
@@ -3896,6 +3966,8 @@ _RUN = "RUN-20260714-001"
 _NOW = "2026-07-14T09:00:00Z"
 _SHA_A = "a" * 64
 _SHA_B = "b" * 64
+_SHA_C = "c" * 64
+_SHA_D = "d" * 64
 
 SourceProposal.minimal_example = {
     "schema_version": SourceProposal.schema_id,
@@ -4424,6 +4496,59 @@ RunExecutionAuthorization.minimal_example = {
 }
 RunExecutionAuthorization.full_example = deepcopy(
     RunExecutionAuthorization.minimal_example
+)
+_SOURCE_DISCOVERY_AUTHORIZATION_INPUT = {
+    "schema_version": RunSourceDiscoveryAuthorizationInput.schema_id,
+    "route_id": "web-search",
+    "provider_id": "tavily",
+    "execution_owner": "deterministic",
+    "credential_env": "TAVILY_API_KEY",
+    "completion_target": "finalized_local",
+    "repair_budget": 1,
+}
+RunSourceDiscoveryAuthorizationInput.minimal_example = deepcopy(
+    _SOURCE_DISCOVERY_AUTHORIZATION_INPUT
+)
+RunSourceDiscoveryAuthorizationInput.full_example = deepcopy(
+    _SOURCE_DISCOVERY_AUTHORIZATION_INPUT
+)
+_SOURCE_DISCOVERY_AUTHORIZATION_BOOTSTRAP = {
+    "schema_version": RunSourceDiscoveryAuthorizationBootstrap.schema_id,
+    "route_id": "web-search",
+    "provider_id": "tavily",
+    "execution_owner": "deterministic",
+    "credential_env": "TAVILY_API_KEY",
+    "completion_target": "finalized_local",
+    "repair_budget": 1,
+}
+RunSourceDiscoveryAuthorizationBootstrap.minimal_example = deepcopy(
+    _SOURCE_DISCOVERY_AUTHORIZATION_BOOTSTRAP
+)
+RunSourceDiscoveryAuthorizationBootstrap.full_example = deepcopy(
+    _SOURCE_DISCOVERY_AUTHORIZATION_BOOTSTRAP
+)
+RunSourceDiscoveryAuthorization.minimal_example = {
+    "schema_version": RunSourceDiscoveryAuthorization.schema_id,
+    "authorization_id": "DISCOVERY-AUTH-001",
+    "run_id": _RUN,
+    "workspace_id": "WS-PUBLIC-DEMO",
+    "run_contract_fingerprint": _SHA_A,
+    "run_direction_fingerprint": _SHA_B,
+    "runtime_source_plan_fingerprint": _SHA_C,
+    "source_route_fingerprint": _SHA_D,
+    "route_id": "web-search",
+    "provider_id": "tavily",
+    "execution_owner": "deterministic",
+    "credential_env": "TAVILY_API_KEY",
+    "completion_target": "finalized_local",
+    "repair_budget": 1,
+    "authorization_event_id": "EVT-DISCOVERY-AUTH-001",
+    "accepted_transaction_id": "TXN-001",
+    "request_fingerprint": _SHA_A,
+    "created_at": _NOW,
+}
+RunSourceDiscoveryAuthorization.full_example = deepcopy(
+    RunSourceDiscoveryAuthorization.minimal_example
 )
 WorkspaceControlStoreBootstrapV2.minimal_example = {
     "schema_version": WorkspaceControlStoreBootstrapV2.schema_id,
@@ -5585,6 +5710,9 @@ V2_CONTRACT_MODELS: tuple[type[StrictModel], ...] = (
     RunExecutionAuthorizationInput,
     RunExecutionAuthorizationBootstrap,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorizationInput,
+    RunSourceDiscoveryAuthorizationBootstrap,
+    RunSourceDiscoveryAuthorization,
     WorkspaceControlStoreBootstrapV2,
     RuntimeAdapterBinding,
     RuntimeWebSearchRequestSpec,
@@ -5861,10 +5989,14 @@ __all__ = [
     "RunArchiveReference",
     "RunContractBinding",
     "RunExecutionAuthorizationReference",
+    "RunSourceDiscoveryAuthorizationReference",
     "RunDirection",
     "RunExecutionAuthorization",
     "RunExecutionAuthorizationBootstrap",
     "RunExecutionAuthorizationInput",
+    "RunSourceDiscoveryAuthorization",
+    "RunSourceDiscoveryAuthorizationBootstrap",
+    "RunSourceDiscoveryAuthorizationInput",
     "RuntimeAdapterBinding",
     "RuntimeCachedPackageAcquisitionSpec",
     "RuntimeNewsApiAcquisitionSpec",

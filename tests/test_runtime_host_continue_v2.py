@@ -117,6 +117,36 @@ def _authorized_workspace(tmp_path: Path) -> Path:
     return tmp_path / "workspace"
 
 
+def _discovery_workspace(tmp_path: Path) -> Path:
+    submitter = InitWebSubmitter(base_dir=tmp_path)
+    body = _body(authorized=False)
+    payload = body["payload"]
+    assert isinstance(payload, dict)
+    selections = payload["selections"]
+    assert isinstance(selections, dict)
+    selections.update(
+        {
+            "source_profile": "llm_decide",
+            "web_search_mode": "external_api",
+            "search_backend": "tavily",
+        }
+    )
+    payload.update(
+        {
+            "completion_target": "finalized_local",
+            "repair_budget": 1,
+            "search_secret_session_id": "discovery-session",
+        }
+    )
+    assert submitter.configure_search_secret(
+        session_id="discovery-session",
+        body={"provider": "tavily", "api_key": "tvly-test-secret-123"},
+    )["configured"] is True
+    status, response = submitter.submit(body)
+    assert status == 200 and response["source_discovery_authorized"] is True
+    return tmp_path / "workspace"
+
+
 def _revision(workspace: Path) -> int:
     with SQLiteControlStore.open(workspace / "briefloop.db") as store:
         head = store.load_workspace_run_head()
@@ -143,6 +173,43 @@ def test_unauthorized_run_returns_typed_zero_write_attention(tmp_path: Path) -> 
     assert result.status == "needs_human"
     assert result.reason_code == "runtime_continuation_unsupported"
     assert _revision(workspace) == revision
+
+
+def test_discovery_only_continue_is_pre_provider_zero_write_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = _discovery_workspace(tmp_path)
+    revision = _revision(workspace)
+    db_bytes = (workspace / "briefloop.db").read_bytes()
+    env_bytes = (workspace / ".env").read_bytes()
+
+    def _provider_must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("provider must not run in 1A")
+
+    monkeypatch.setattr(
+        "multi_agent_brief.sources.web_search.WebSearchProvider.collect",
+        _provider_must_not_run,
+    )
+    result = _service(workspace).continue_authorized()
+
+    assert result.status == "needs_attention"
+    assert result.reason_code == "automatic_source_acquisition_not_yet_available"
+    assert result.current_stage == "source-discovery"
+    assert result.trace.transaction_ids == []
+    assert result.trace.next_action.effect_kind == (
+        "source_discovery_acquisition_unavailable"
+    )
+    assert _revision(workspace) == revision
+    assert (workspace / "briefloop.db").read_bytes() == db_bytes
+    assert (workspace / ".env").read_bytes() == env_bytes
+    with SQLiteControlStore.open(workspace / "briefloop.db") as store:
+        head = store.load_workspace_run_head()
+        assert head is not None
+        snapshot = store.load_snapshot(head.current_run_id)
+    assert len(snapshot.run_execution_authorizations) == 0
+    assert len(snapshot.run_source_discovery_authorizations) == 1
+    assert snapshot.sources == ()
 
 
 def test_authorized_continue_commits_pack_and_returns_exact_role_work(
@@ -364,10 +431,11 @@ def test_finalize_effect_suppresses_legacy_hook_then_presents_terminal(
     def _current(action, revision: int):
         snapshot = SimpleNamespace(
             run=SimpleNamespace(run_id="RUN-TEST"),
-            store_revision=revision,
-            stage_states=[],
-            run_execution_authorizations=[object()],
-        )
+                store_revision=revision,
+                stage_states=[],
+                run_execution_authorizations=[object()],
+                run_source_discovery_authorizations=[],
+            )
         return SimpleNamespace(
             action=action,
             verified=SimpleNamespace(snapshot=snapshot),

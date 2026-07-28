@@ -19,11 +19,13 @@ from multi_agent_brief.contracts.v2 import (
     InvocationStartRequest,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     RuntimeAdapterBinding,
     RuntimeSourcePlanBinding,
     ScreenedCandidatesProposal,
     TransactionReceipt,
     authorized_input_classification_bytes,
+    canonical_run_direction_for_binding,
 )
 from multi_agent_brief.control_store import (
     ControlStoreCommitOutcomeUnknown,
@@ -329,6 +331,7 @@ _AUTHORITATIVE_RECEIPT_RELATION_FAMILIES = frozenset(
         "proposal_ids",
         "run_contract_bindings",
         "run_execution_authorizations",
+        "run_source_discovery_authorizations",
         "owned_artifact_submissions",
         "stage_transitions",
         "stage_artifact_bindings",
@@ -375,6 +378,7 @@ _CORE_EFFECT_BINDING_RULES = {
                 "artifact_identities",
                 "run_contract_bindings",
                 "run_execution_authorizations",
+                "run_source_discovery_authorizations",
                 "stage_transitions",
                 "run_integrity_records",
             }
@@ -1375,6 +1379,11 @@ class CoreRunDomainVerifier:
         self._verify_contract_fingerprint(binding)
         self._verify_receipt_bindings(snapshot)
         self._verify_execution_authorization(reader, snapshot, binding)
+        self._verify_source_discovery_authorization(
+            snapshot,
+            binding,
+            source_plan,
+        )
         self._verify_checkout_revisions(history, snapshot)
         self._verify_invocation_ownership(snapshot, binding)
         classify_current_lineage(snapshot)
@@ -1456,6 +1465,86 @@ class CoreRunDomainVerifier:
             record,
             manifest,
         )
+
+    @staticmethod
+    def _verify_source_discovery_authorization(
+        snapshot: ControlStoreSnapshot,
+        binding: RunContractBinding,
+        source_plan,
+    ) -> None:
+        records = snapshot.run_source_discovery_authorizations
+        if len(records) > 1:
+            raise CoreRunError("control_store_integrity_invalid")
+        if not records:
+            return
+        record = records[0]
+        routes = [
+            route
+            for route in source_plan.routes
+            if route.route_id == record.route_id
+            and route.provider_id == record.provider_id
+            and route.execution_owner == record.execution_owner
+            and route.route_kind == "external_api"
+            and route.acquisition_spec is not None
+        ]
+        if (
+            record.run_id != snapshot.run.run_id
+            or record.workspace_id != snapshot.run.workspace_id
+            or record.run_contract_fingerprint != binding.contract_fingerprint
+            or record.run_direction_fingerprint
+            != canonical_fingerprint(
+                canonical_run_direction_for_binding(
+                    binding.run_direction.model_dump(mode="json", exclude_unset=False)
+                )
+            )
+            or record.runtime_source_plan_fingerprint
+            != source_plan.source_plan_fingerprint
+            or len(routes) != 1
+            or record.source_route_fingerprint != routes[0].route_fingerprint
+        ):
+            raise CoreRunError("control_store_integrity_invalid")
+        receipt = next(
+            (
+                item
+                for item in snapshot.transactions
+                if item.transaction_id == record.accepted_transaction_id
+            ),
+            None,
+        )
+        effectful_relations = (
+            receipt is not None
+            and (
+                receipt.run_execution_authorizations
+                or receipt.source_ids
+                or receipt.proposal_ids
+                or receipt.owned_artifact_submissions
+                or receipt.claims
+                or receipt.claim_freezes
+                or receipt.gate_evaluations
+                or receipt.gate_findings
+                or receipt.gate_artifact_bindings
+                or receipt.finalize_renders
+                or receipt.finalizations
+                or receipt.run_archives
+                or receipt.package_ready_records
+                or receipt.approvals
+                or receipt.delivery_authorizations
+                or receipt.delivery_attempts
+                or receipt.delivery_results
+            )
+        )
+        if (
+            receipt is None
+            or receipt.transaction_type != transaction_type_for("initialize")
+            or [
+                item.authorization_id
+                for item in receipt.run_source_discovery_authorizations
+            ]
+            != [record.authorization_id]
+            or record.authorization_event_id not in receipt.event_ids
+            or effectful_relations
+        ):
+            raise CoreRunError("control_store_integrity_invalid")
 
     @staticmethod
     def _verify_authorized_source_pack(

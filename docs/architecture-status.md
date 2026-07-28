@@ -14,6 +14,13 @@ page describes implemented runtime capability, not a breaking deep rename.
 - The active new-run path is Experimental, fresh SQLite-only Codex. `briefloop
   init` writes the strict bootstrap; `briefloop run --runtime codex` creates or
   verifies `briefloop.db` and returns one Store-derived `CoreRunNextAction`.
+- Experimental Pilot Entry 1A can record a human-confirmed public-web/Tavily
+  direction as a distinct receipt-owned discovery authorization. It makes
+  `briefloop runtime continue` the truthful handoff, which currently returns a
+  fixed pre-provider attention result with no secret lookup, SDK, provider,
+  network, source, role, or Store effect. Automatic Tavily acquisition is NOT
+  MEASURED and unavailable; this authority does not imply source evidence,
+  execution authority, Gate/finalization, or `finalized_local` completion.
 - SQLite ControlStore receipts and ledger relations are the sole runtime
   authority. Strict Pydantic DTOs are the write boundary; deterministic domain
   services own effects; agents write only invocation scratch proposals.

@@ -64,6 +64,7 @@ from multi_agent_brief.contracts.v2 import (
     ArtifactSupersessionRecord,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     RunIdentity,
     RunIntegrityRecord,
     RunArchiveArtifactBinding,
@@ -114,6 +115,7 @@ _EXTENDED_RECORD_MODELS = (
     ProposalSourceBinding,
     RunContractBinding,
     RunExecutionAuthorization,
+    RunSourceDiscoveryAuthorization,
     OwnedArtifactSubmissionRecord,
     StageTransitionRecord,
     StageArtifactBinding,
@@ -348,6 +350,7 @@ class ControlStoreSnapshot:
     proposal_source_bindings: tuple[ProposalSourceBinding, ...]
     run_contract_bindings: tuple[RunContractBinding, ...]
     run_execution_authorizations: tuple[RunExecutionAuthorization, ...]
+    run_source_discovery_authorizations: tuple[RunSourceDiscoveryAuthorization, ...]
     owned_artifact_submissions: tuple[OwnedArtifactSubmissionRecord, ...]
     stage_transitions: tuple[StageTransitionRecord, ...]
     stage_artifact_bindings: tuple[StageArtifactBinding, ...]
@@ -652,6 +655,11 @@ class ControlStoreHistory:
             ("authorization_id",),
             full.run_execution_authorizations,
         )
+        run_source_discovery_authorizations = selected(
+            "run_source_discovery_authorizations",
+            ("authorization_id",),
+            full.run_source_discovery_authorizations,
+        )
         stage_artifact_bindings = selected(
             "stage_artifact_bindings",
             ("transition_id", "position"),
@@ -816,6 +824,7 @@ class ControlStoreHistory:
             proposal_source_bindings=proposal_source_bindings,
             run_contract_bindings=run_contract_bindings,
             run_execution_authorizations=run_execution_authorizations,
+            run_source_discovery_authorizations=run_source_discovery_authorizations,
             owned_artifact_submissions=owned_artifact_submissions,
             stage_transitions=stage_transitions,
             stage_artifact_bindings=stage_artifact_bindings,
@@ -1497,6 +1506,9 @@ class SQLiteControlStore:
                 self._insert_run_execution_authorization(
                     uow._run_execution_authorization
                 )
+                self._insert_run_source_discovery_authorization(
+                    uow._run_source_discovery_authorization
+                )
                 self._insert_owned_artifact_submissions(
                     uow._owned_artifact_submissions.values()
                 )
@@ -1902,6 +1914,19 @@ class SQLiteControlStore:
             ):
                 raise ControlStoreConflict("relational_integrity_conflict")
 
+        source_discovery_authorization = uow._run_source_discovery_authorization
+        if source_discovery_authorization is not None:
+            if (
+                source_discovery_authorization.accepted_transaction_id
+                != uow.transaction_id
+                or source_discovery_authorization.authorization_event_id
+                not in staged_events
+                or binding is None
+                or source_discovery_authorization.run_contract_fingerprint
+                != binding.contract_fingerprint
+            ):
+                raise ControlStoreConflict("relational_integrity_conflict")
+
         for record in uow._owned_artifact_submissions.values():
             if (
                 record.accepted_transaction_id != uow.transaction_id
@@ -1952,6 +1977,7 @@ class SQLiteControlStore:
             (
                 uow._run_contract_binding is not None,
                 uow._run_execution_authorization is not None,
+                uow._run_source_discovery_authorization is not None,
                 bool(uow._owned_artifact_submissions),
                 bool(uow._stage_transitions),
                 bool(uow._claims),
@@ -2281,6 +2307,17 @@ class SQLiteControlStore:
                     "run_execution_authorizations": (
                         [{"authorization_id": uow._run_execution_authorization.authorization_id}]
                         if uow._run_execution_authorization is not None
+                        else []
+                    ),
+                    "run_source_discovery_authorizations": (
+                        [
+                            {
+                                "authorization_id": (
+                                    uow._run_source_discovery_authorization.authorization_id
+                                )
+                            }
+                        ]
+                        if uow._run_source_discovery_authorization is not None
                         else []
                     ),
                     "owned_artifact_submissions": [
@@ -3061,6 +3098,47 @@ class SQLiteControlStore:
             ),
         )
 
+    def _insert_run_source_discovery_authorization(
+        self,
+        record: RunSourceDiscoveryAuthorization | None,
+    ) -> None:
+        if record is None:
+            return
+        self._connection.execute(
+            """
+            INSERT INTO run_source_discovery_authorizations(
+                run_id, authorization_id, workspace_id, schema_version,
+                run_contract_fingerprint, run_direction_fingerprint,
+                runtime_source_plan_fingerprint, source_route_fingerprint,
+                route_id, provider_id, execution_owner, credential_env,
+                completion_target, repair_budget, authorization_event_id,
+                accepted_transaction_id, request_fingerprint, created_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.run_id,
+                record.authorization_id,
+                record.workspace_id,
+                record.schema_version,
+                record.run_contract_fingerprint,
+                record.run_direction_fingerprint,
+                record.runtime_source_plan_fingerprint,
+                record.source_route_fingerprint,
+                record.route_id,
+                record.provider_id,
+                record.execution_owner,
+                record.credential_env,
+                record.completion_target,
+                record.repair_budget,
+                record.authorization_event_id,
+                record.accepted_transaction_id,
+                record.request_fingerprint,
+                record.created_at,
+                _canonical_record_text(record),
+            ),
+        )
+
     def _insert_owned_artifact_submissions(
         self,
         records: Iterable[OwnedArtifactSubmissionRecord],
@@ -3758,6 +3836,22 @@ class SQLiteControlStore:
             self._connection.execute(
                 """
                 INSERT INTO transaction_run_execution_authorizations(
+                    run_id, transaction_id, position, authorization_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    receipt.run_id,
+                    receipt.transaction_id,
+                    position,
+                    reference.authorization_id,
+                ),
+            )
+        for position, reference in enumerate(
+            receipt.run_source_discovery_authorizations
+        ):
+            self._connection.execute(
+                """
+                INSERT INTO transaction_run_source_discovery_authorizations(
                     run_id, transaction_id, position, authorization_id
                 ) VALUES (?, ?, ?, ?)
                 """,
@@ -4656,6 +4750,34 @@ class SQLiteControlStore:
                     ),
                     "source_manifest_sha256": "source_manifest_sha256",
                     "source_manifest_member_count": "source_manifest_member_count",
+                    "repair_budget": "repair_budget",
+                    "authorization_event_id": "authorization_event_id",
+                    "accepted_transaction_id": "accepted_transaction_id",
+                    "request_fingerprint": "request_fingerprint",
+                    "created_at": "created_at",
+                },
+            ),
+            run_source_discovery_authorizations=self._load_for_run(
+                RunSourceDiscoveryAuthorization,
+                "run_source_discovery_authorizations",
+                run_id,
+                "authorization_id",
+                {
+                    "run_id": "run_id",
+                    "authorization_id": "authorization_id",
+                    "workspace_id": "workspace_id",
+                    "schema_version": "schema_version",
+                    "run_contract_fingerprint": "run_contract_fingerprint",
+                    "run_direction_fingerprint": "run_direction_fingerprint",
+                    "runtime_source_plan_fingerprint": (
+                        "runtime_source_plan_fingerprint"
+                    ),
+                    "source_route_fingerprint": "source_route_fingerprint",
+                    "route_id": "route_id",
+                    "provider_id": "provider_id",
+                    "execution_owner": "execution_owner",
+                    "credential_env": "credential_env",
+                    "completion_target": "completion_target",
                     "repair_budget": "repair_budget",
                     "authorization_event_id": "authorization_event_id",
                     "accepted_transaction_id": "accepted_transaction_id",
@@ -6399,6 +6521,14 @@ class SQLiteControlStore:
                 ),
             ),
             (
+                "transaction_run_source_discovery_authorizations",
+                ("authorization_id",),
+                tuple(
+                    (item.authorization_id,)
+                    for item in receipt.run_source_discovery_authorizations
+                ),
+            ),
+            (
                 "transaction_owned_artifact_submissions",
                 ("submission_id",),
                 tuple(
@@ -6991,6 +7121,13 @@ class SQLiteControlStore:
                 "transaction_run_execution_authorizations",
                 ("authorization_id",),
                 "run_execution_authorizations",
+                ("authorization_id",),
+                True,
+            ),
+            (
+                "transaction_run_source_discovery_authorizations",
+                ("authorization_id",),
+                "run_source_discovery_authorizations",
                 ("authorization_id",),
                 True,
             ),

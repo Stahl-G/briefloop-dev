@@ -59,28 +59,43 @@ class _StubSubmitter:
             "receipt": {},
             "workspace": "/private/secret/workspace",
             "execution_authorized": self._authorized,
+            "source_discovery_authorized": self._tavily_discovery,
             "next_action": {
-                "action_kind": "deterministic",
-                "effect_kind": "doctor_check",
-                "reason_code": "doctor_check_required",
-                "stage_id": None,
+                "action_kind": (
+                    "blocked" if self._tavily_discovery else "deterministic"
+                ),
+                "effect_kind": (
+                    "source_discovery_acquisition_unavailable"
+                    if self._tavily_discovery
+                    else "doctor_check"
+                ),
+                "reason_code": (
+                    "automatic_source_acquisition_not_yet_available"
+                    if self._tavily_discovery
+                    else "doctor_check_required"
+                ),
+                "stage_id": "source-discovery" if self._tavily_discovery else None,
                 "role_id": None,
             },
-            "progress": {"reason_code": "doctor_check_required"},
+            "progress": {
+                "reason_code": (
+                    "automatic_source_acquisition_not_yet_available"
+                    if self._tavily_discovery
+                    else "doctor_check_required"
+                )
+            },
         }
-        if self._authorized:
+        if self._authorized or self._tavily_discovery:
             response["completion_target"] = "finalized_local"
             response["repair_budget"] = 1
-        else:
-            response["completion_target"] = None
-            response["repair_budget"] = None
         if self._tavily_discovery:
             response["source_discovery"] = {
-                "mode": "automatic",
+                "mode": "pre_provider_authorization",
                 "profile": "llm_decide",
                 "backend": "tavily",
                 "api_key_env": "TAVILY_API_KEY",
             }
+            response["search_secret_status"] = "ready"
         return 200, response
 
 
@@ -145,6 +160,7 @@ def test_get_assets_and_security_headers(server) -> None:
     assert b"else if (!hasCurrentOutputContractPreview())" in body
     assert b"finalized_local" in body
     assert b"payload.repair_budget = 1" in body
+    assert b'payload.completion_target = "finalized_local"' in body
     assert b'/api/v1/search-secret' in body
     assert (
         b'web_search_mode: c.source === "public_web" ? "external_api" : "disabled"'
@@ -165,6 +181,9 @@ def test_get_assets_and_security_headers(server) -> None:
     assert b"This creates a local workspace/run without RunExecutionAuthorization" in body
     assert b'"review_web_boundary"' in body
     assert b'"review_authorized_boundary"' in body
+    assert b"Confirm Tavily discovery direction (Experimental)" in body
+    assert b"1A does not call Tavily" in body
+    assert b"automatic discovery enabled" not in body
     assert b"review_statement" not in body
     status, _headers, _body = _request(server, "GET", "/assets/style.css")
     assert status == 200
@@ -322,7 +341,7 @@ def test_manual_success_never_claims_authorized_terminal_or_budget() -> None:
         instance.close()
 
 
-def test_public_web_success_reports_automatic_tavily_discovery() -> None:
+def test_public_web_success_reports_pre_provider_discovery_authorization() -> None:
     instance = create_init_web_server(
         _StubSubmitter(authorized=False, tavily_discovery=True),
         exit_on_success=False,
@@ -343,12 +362,19 @@ def test_public_web_success_reports_automatic_tavily_discovery() -> None:
         payload = json.loads(body)
         assert status == 200
         assert payload["execution_authorized"] is False
+        assert payload["source_discovery_authorized"] is True
+        assert payload["completion_target"] == "finalized_local"
+        assert payload["repair_budget"] == 1
+        assert payload["search_secret_status"] == "ready"
         assert payload["source_discovery"] == {
-            "mode": "automatic",
+            "mode": "pre_provider_authorization",
             "profile": "llm_decide",
             "backend": "tavily",
             "api_key_env": "TAVILY_API_KEY",
         }
+        assert payload["first_action"]["reason_code"] == (
+            "automatic_source_acquisition_not_yet_available"
+        )
     finally:
         instance.close()
 
